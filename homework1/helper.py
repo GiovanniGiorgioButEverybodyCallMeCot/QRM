@@ -3,14 +3,14 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 import os
+import seaborn as sns
 from scipy import stats
 from statsmodels.graphics.tsaplots import plot_acf, plot_pacf
 
 
-def compute_descriptive_statistics(
+def visual_descriptive_statistics(
     returns_df: pd.DataFrame, plot: bool = True, save: bool = True
 ) -> None:
-    rolling_window = 252  # 1 year for daily data
     """
     Generate diagnostic plots for each asset's returns in the given DataFrame.
 
@@ -19,9 +19,36 @@ def compute_descriptive_statistics(
         plot: Whether to display the plots.
         save: Whether to save the plots as PNG files.
     """
+
+    rolling_window = 252  # 1 year for daily data
     assets = returns_df.columns
     if save:
         os.makedirs("images/2", exist_ok=True)
+
+    # ————————————————————————————————————————————
+    # Correlation matrix heatmap
+    # ————————————————————————————————————————————
+    corr_matrix = returns_df.corr()
+    mask = np.triu(np.ones_like(corr_matrix, dtype=bool))
+
+    plt.figure(figsize=(18, 12))
+    sns.heatmap(
+        corr_matrix,
+        mask=mask,
+        cmap="coolwarm",
+        annot=True,
+        square=True,
+        annot_kws={"size": 8, "weight": "bold", "color": "black"},
+        cbar_kws={"shrink": 0.75},
+    )
+    plt.title("Correlation Matrix between Returns", fontsize=18, weight="bold", pad=22)
+    plt.xticks(rotation=45, ha="right", fontsize=9, weight="medium")
+    plt.yticks(rotation=0, fontsize=9, weight="medium")
+    plt.tight_layout()
+    if plot:
+        plt.show()
+    if save:
+        plt.savefig("images/correlation_matrix_returns.png", dpi=300)
 
     # ————————————————————————————————————————————
     # Plot Histograms with Normal Fit and QQ-Plots
