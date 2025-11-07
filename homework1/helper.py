@@ -7,6 +7,11 @@ import seaborn as sns
 from scipy import stats
 from statsmodels.stats.diagnostic import acorr_ljungbox
 from statsmodels.graphics.tsaplots import plot_acf, plot_pacf
+from arch import arch_model
+
+UNIVARIATE_GARCH_MODELS = ["GARCH", "GARCH-GJR", "EGARCH", "EGARCH-GJR"]
+# ———————————————————————————————————————————————————————————————————————————————————————————————————————————————————————— #
+# Descriptive Statistics and Diagnostic Plots
 
 
 def visual_descriptive_statistics(
@@ -96,7 +101,6 @@ def visual_descriptive_statistics(
         # ACF of returns
         plot_acf(r.dropna(), ax=axes_acf[i, 0], lags=40)
         axes_acf[i, 0].set_title(f"ACF (Returns) — {col}", fontsize=10)
-
         # ACF of squared returns
         plot_acf((r**2).dropna(), ax=axes_acf[i, 1], lags=40)
         axes_acf[i, 1].set_title(f"ACF (Squared Returns) — {col}", fontsize=10)
@@ -118,7 +122,6 @@ def visual_descriptive_statistics(
         # PACF of returns
         plot_pacf(r.dropna(), ax=axes_pacf[i, 0], lags=40)
         axes_pacf[i, 0].set_title(f"PACF (Returns) — {col}", fontsize=10)
-
         # PACF of squared returns
         plot_pacf((r**2).dropna(), ax=axes_pacf[i, 1], lags=40)
         axes_pacf[i, 1].set_title(f"PACF (Squared Returns) — {col}", fontsize=10)
@@ -133,6 +136,7 @@ def visual_descriptive_statistics(
     # Compute and Plot Rolling Moments
     # ————————————————————————————————————————————
 
+    # Calculate rolling moments
     rolling = {
         "mean": returns_df.rolling(rolling_window).mean(),
         "var": returns_df.rolling(rolling_window).var(),
@@ -140,21 +144,26 @@ def visual_descriptive_statistics(
         "kurtosis": returns_df.rolling(rolling_window).kurt(),
     }
 
-    _, axes = plt.subplots(4, 1, figsize=(12, 10), sharex=True)
-
+    # Plot rolling moments
+    _, axes = plt.subplots(4, 1, figsize=(14, 14))
     for col in returns_df.columns:
-        axes[0].plot(rolling["mean"].index, rolling["mean"][col], lw=1.5, alpha=0.65)
+        axes[0].plot(rolling["mean"].index, rolling["mean"][col], lw=1, alpha=0.6)
         axes[1].plot(rolling["var"].index, rolling["var"][col], lw=1.5, alpha=0.65)
         axes[2].plot(rolling["skew"].index, rolling["skew"][col], lw=1.5, alpha=0.65)
         axes[3].plot(
             rolling["kurtosis"].index, rolling["kurtosis"][col], lw=1.5, alpha=0.65
         )
 
+    # Set labels and titles
     axes[0].set_ylabel("Mean")
     axes[1].set_ylabel("Variance")
     axes[2].set_ylabel("Skewness")
     axes[3].set_ylabel("Kurtosis")
-    axes[0].set_title(f"Rolling Moments (window={rolling_window}, all assets)")
+    # Format x-axis
+    for ax in axes:
+        ax.xaxis.set_major_locator(mdates.YearLocator())
+        ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y"))
+        ax.tick_params(axis="x", rotation=45)
     plt.tight_layout()
     if save:
         plt.savefig("images/2/rolling_moments.png", dpi=300)
@@ -170,13 +179,20 @@ def visual_descriptive_statistics(
     np.fill_diagonal(corr.values, np.nan)
     asset_1, asset_2 = corr.stack().idxmax()  # pair with highest |corr|
 
+    # Plot rolling correlation
     roll_corr = returns_df[asset_1].rolling(rolling_window).corr(returns_df[asset_2])
-
     plt.figure(figsize=(10, 4))
     plt.plot(roll_corr)
+
+    # Format x-axis
+    plt.gca().xaxis.set_major_locator(mdates.YearLocator())
+    plt.gca().xaxis.set_major_formatter(mdates.DateFormatter("%Y"))
+
+    # Set labels and title
     plt.title(f"Rolling Correlation (window={rolling_window}) — {asset_1} vs {asset_2}")
     plt.ylabel("Correlation")
     plt.xlabel("Date")
+    plt.tick_params(axis="x", rotation=45)
     if save:
         plt.savefig("images/2/highest_rolling_correlation.png", dpi=300)
     if plot:
@@ -202,6 +218,214 @@ def visual_descriptive_statistics(
                 lambda x: (np.abs(x) > 3 * x.std()).sum()
             ),
         }
-    ).round(4)
+    ).round(
+        4
+    )  # more readable
 
     return descriptive_stat_df
+
+
+# ———————————————————————————————————————————————————————————————————————————————————————————————————————————————————————— #
+# GARCH-Type Model Fitting and Comparison
+
+
+def univariate_garch_diagnostics(
+    training_set: pd.DataFrame, plot: bool = True, save: bool = True
+) -> dict:
+    """
+    Fits and compares four GARCH-type models: GARCH(1,1), GARCH(1,1)-GJR(1,1), EGARCH(1,1), EGARCH(1,1)-GJR(1,1) for each asset's returns in the given DataFrame.
+    Plots the conditional variances and computes average AIC and BIC.
+    Args:
+        training_set: DataFrame containing asset returns for model fitting.
+        plot: Whether to display the plots.
+        save: Whether to save the plots as PNG files.
+    Returns:
+        Dictionary containing average AIC and BIC for each model across all assets.
+    """
+    # ————————————————————————————————————————————
+    # Fit GARCH-type models for each asset
+    # ————————————————————————————————————————————
+    results = {}
+    for asset in training_set.columns:
+        # Fit GARCH(1,1)
+        garch_results = arch_model(
+            training_set[asset].dropna(),
+            vol="GARCH",
+            p=1,
+            q=1,
+            dist="Normal",
+            mean="Constant",
+        ).fit(disp="off")
+        # Fit GARCH(1,1)-GJR(1,1)
+        garch_gjr_results = arch_model(
+            training_set[asset].dropna(),
+            vol="GARCH",
+            p=1,
+            o=1,
+            q=1,
+            dist="Normal",
+            mean="Constant",
+        ).fit(disp="off")
+        # Fit EGARCH(1,1)
+        egarch_results = arch_model(
+            training_set[asset].dropna(),
+            vol="EGARCH",
+            p=1,
+            q=1,
+            dist="Normal",
+            mean="Constant",
+        ).fit(disp="off")
+        # Fit EGARCH(1,1)-GJR(1,1)
+        egarch_gjr_results = arch_model(
+            training_set[asset].dropna(),
+            vol="EGARCH",
+            p=1,
+            o=1,
+            q=1,
+            dist="Normal",
+            mean="Constant",
+        ).fit(disp="off")
+        # Store results
+        results[asset] = {
+            "GARCH": garch_results,
+            "GARCH-GJR": garch_gjr_results,
+            "EGARCH": egarch_results,
+            "EGARCH-GJR": egarch_gjr_results,
+        }
+
+    # ————————————————————————————————————————————
+    # Plot conditional variances
+    # ————————————————————————————————————————————
+
+    n_rows = (len(training_set.columns) + 1) // 2
+    _, axes = plt.subplots(n_rows, 2, figsize=(14, 3 * n_rows))
+    axes = axes.flatten()  # Flatten to index easily on 1D
+
+    for i, asset in enumerate(training_set.columns):
+        axes[i].plot(
+            results[asset]["GARCH-GJR"].conditional_volatility ** 2,
+            alpha=0.6,
+            label=f"GARCH-GJR",
+            color="red",
+        )
+        axes[i].plot(
+            results[asset]["GARCH"].conditional_volatility ** 2,
+            alpha=0.6,
+            label=f"GARCH",
+            color="green",
+        )
+        axes[i].plot(
+            results[asset]["EGARCH-GJR"].conditional_volatility ** 2,
+            alpha=0.6,
+            label=f"EGARCH-GJR",
+            color="yellow",
+        )
+        axes[i].plot(
+            results[asset]["EGARCH"].conditional_volatility ** 2,
+            alpha=0.6,
+            label=f"EGARCH",
+            color="blue",
+        )
+        axes[i].legend()
+        axes[i].set_title(asset)
+
+    # Hide any unused subplots if you have an odd number of assets (we shoulnt't, but just in case)
+    for j in range(i + 1, len(axes)):
+        axes[j].set_visible(False)
+
+    plt.tight_layout()
+    if save:
+        plt.savefig("images/2/garch_model_comparison.png", dpi=300)
+    if plot:
+        plt.show()
+
+    # ————————————————————————————————————————————————————————
+    # Compute average AIC and BIC across assets for each model
+    # ————————————————————————————————————————————————————————
+
+    avg_metrics = {}
+    for model_name in UNIVARIATE_GARCH_MODELS:
+        aic_values = [results[asset][model_name].aic for asset in training_set.columns]
+        bic_values = [results[asset][model_name].bic for asset in training_set.columns]
+        avg_metrics[model_name] = [np.mean(aic_values), np.mean(bic_values)]
+
+    return avg_metrics
+
+
+# ———————————————————————————————————————————————————————————————————————————————————————————————————————————————————————— #
+# GARCH-Type Model Fitting and Comparison on Equally Weighted Portfolio
+
+
+def ewp_garch_diagnostics(
+    ewp: pd.Series, plot: bool = True, save: bool = True, print_summaries: bool = False
+) -> dict:
+    """
+    Fits and compares four GARCH-type models: GARCH(1,1), GARCH(1,1)-GJR(1,1), EGARCH(1,1), EGARCH(1,1)-GJR(1,1) for the EWP returns.
+    Plots the conditional variances of the models.
+    Args:
+        ewp: Series containing EWP returns.
+        plot: Whether to display the plots.
+        save: Whether to save the plots as PNG files.
+        print_summaries: Whether to print model summaries.
+    Returns:
+        Dictionary containing AIC and BIC for each model.
+    """
+
+    results = {
+        "GARCH": arch_model(
+            ewp, vol="Garch", p=1, q=1, dist="Normal", mean="Constant"
+        ).fit(disp="off"),
+        "GARCH-GJR": arch_model(
+            ewp, vol="GARCH", p=1, o=1, q=1, dist="Normal", mean="Constant"
+        ).fit(disp="off"),
+        "EGARCH": arch_model(
+            ewp, vol="EGARCH", p=1, q=1, dist="Normal", mean="Constant"
+        ).fit(disp="off"),
+        "EGARCH-GJR": arch_model(
+            ewp, vol="EGARCH", p=1, o=1, q=1, dist="Normal", mean="Constant"
+        ).fit(disp="off"),
+    }
+
+    # Portfolio -> plotted singularly because this order is better for visualization
+    plt.figure(figsize=(8, 5))
+    plt.plot(
+        results["GARCH-GJR"].conditional_volatility ** 2,
+        alpha=0.7,
+        label="GARCH-GJR",
+        color="red",
+    )
+    plt.plot(
+        results["GARCH"].conditional_volatility ** 2,
+        alpha=0.7,
+        label="GARCH",
+        color="green",
+    )
+    plt.plot(
+        results["EGARCH-GJR"].conditional_volatility ** 2,
+        alpha=0.7,
+        label="EGARCH-GJR",
+        color="yellow",
+    )
+    plt.plot(
+        results["EGARCH"].conditional_volatility ** 2,
+        alpha=0.7,
+        label="EGARCH",
+        color="blue",
+    )
+    plt.title("Conditional Variance of Normal Garch (1,1) models - EWP")
+    plt.xlabel("Date")
+    plt.ylabel("Variance")
+    plt.legend()
+    plt.tight_layout()
+    if save:
+        plt.savefig("images/2/ewp_garch_model_comparison.png", dpi=300)
+    if plot:
+        plt.show()
+
+    if print_summaries:
+        for garch_model in UNIVARIATE_GARCH_MODELS:
+            print(results[garch_model].summary)
+    return {
+        garch_model: [results[garch_model].aic, results[garch_model].bic]
+        for garch_model in UNIVARIATE_GARCH_MODELS
+    }
