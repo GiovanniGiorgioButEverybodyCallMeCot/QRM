@@ -5,6 +5,7 @@ import matplotlib.dates as mdates
 import os
 import seaborn as sns
 from scipy import stats
+from statsmodels.stats.diagnostic import acorr_ljungbox
 from statsmodels.graphics.tsaplots import plot_acf, plot_pacf
 
 
@@ -12,12 +13,20 @@ def visual_descriptive_statistics(
     returns_df: pd.DataFrame, plot: bool = True, save: bool = True
 ) -> None:
     """
-    Generate diagnostic plots for each asset's returns in the given DataFrame.
+    Computes basic descriptive statistics and generates the following diagnostic plots for each asset's returns in the given DataFrame:
+    1. Correlation matrix heatmap between asset returns.
+    2. Histograms with normal distribution fit and QQ-plots.
+    3. ACF and PACF plots for asset returns.
+    4. Rolling moments (mean, variance, skewness, kurtosis) for asset returns.
+    5. Highest rolling correlation between any two assets.
 
     Args:
         returns_df: DataFrame containing asset returns.
         plot: Whether to display the plots.
         save: Whether to save the plots as PNG files.
+
+    Returns:
+        DataFrame containing descriptive statistics for each asset's returns.
     """
 
     rolling_window = 252  # 1 year for daily data
@@ -172,3 +181,27 @@ def visual_descriptive_statistics(
         plt.savefig("images/2/highest_rolling_correlation.png", dpi=300)
     if plot:
         plt.show()
+
+    # ————————————————————————————————————————————
+    # Descriptive Statistics DataFrame
+    # ————————————————————————————————————————————
+
+    descriptive_stat_df = pd.DataFrame(
+        {
+            "mean": returns_df.mean(),
+            "std": returns_df.std(),
+            "skew": returns_df.skew(),
+            "kurtosis_excess": returns_df.kurtosis(),
+            "jarque_bera_p": returns_df.apply(lambda x: stats.jarque_bera(x)[1]),
+            "ljungbox_p(10)": returns_df.apply(
+                lambda x: acorr_ljungbox(x, lags=[10], return_df=True)[
+                    "lb_pvalue"
+                ].values[0]
+            ),
+            "n_extreme_3std": returns_df.apply(
+                lambda x: (np.abs(x) > 3 * x.std()).sum()
+            ),
+        }
+    ).round(4)
+
+    return descriptive_stat_df
