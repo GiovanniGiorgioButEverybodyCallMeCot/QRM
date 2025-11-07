@@ -11,7 +11,7 @@ from statsmodels.graphics.tsaplots import plot_acf, plot_pacf
 
 def visual_descriptive_statistics(
     returns_df: pd.DataFrame, plot: bool = True, save: bool = True
-) -> None:
+) -> pd.DataFrame:
     """
     Computes basic descriptive statistics and generates the following diagnostic plots for each asset's returns in the given DataFrame:
     1. Correlation matrix heatmap between asset returns.
