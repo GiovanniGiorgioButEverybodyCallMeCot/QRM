@@ -8,8 +8,43 @@ from scipy import stats
 from statsmodels.stats.diagnostic import acorr_ljungbox
 from statsmodels.graphics.tsaplots import plot_acf, plot_pacf
 from arch import arch_model
+from scipy.stats import t, kstest, norm
+from typing import Tuple, Dict
 
 UNIVARIATE_GARCH_MODELS = ["GARCH", "GARCH-GJR", "EGARCH", "EGARCH-GJR"]
+
+# ——————————————————————————————————————————————————————————————————————————————————————————————————————————————————————— #
+# GARCH-Type Model Fitting Helper Function
+
+
+def fit_garch_models(
+    ewp: pd.Series, distribution: str = "Normal", exclude: list = []
+) -> dict:
+    """
+    Fits various GARCH-type models to the given equally weighted portfolio (EWP) returns.
+    Args:
+        ewp: Series containing EWP returns.
+        exclude: List of model names to exclude from fitting.
+    Returns:
+        Dictionary containing fitted models.
+    """
+    model_specs = {
+        "GARCH": {"vol": "GARCH", "p": 1, "q": 1},
+        "GARCH-GJR": {"vol": "GARCH", "p": 1, "o": 1, "q": 1},
+        "EGARCH": {"vol": "EGARCH", "p": 1, "q": 1},
+        "EGARCH-GJR": {"vol": "EGARCH", "p": 1, "o": 1, "q": 1},
+    }
+
+    # I know that fitting models one by one is more readable, but how cool is this dictionary comprehension?
+    return {
+        name: arch_model(ewp, **specs, dist=distribution, mean="Constant").fit(
+            disp="off"
+        )
+        for name, specs in model_specs.items()
+        if name not in exclude
+    }
+
+
 # ———————————————————————————————————————————————————————————————————————————————————————————————————————————————————————— #
 # Descriptive Statistics and Diagnostic Plots
 
@@ -247,51 +282,8 @@ def univariate_garch_diagnostics(
     # ————————————————————————————————————————————
     results = {}
     for asset in training_set.columns:
-        # Fit GARCH(1,1)
-        garch_results = arch_model(
-            training_set[asset].dropna(),
-            vol="GARCH",
-            p=1,
-            q=1,
-            dist="Normal",
-            mean="Constant",
-        ).fit(disp="off")
-        # Fit GARCH(1,1)-GJR(1,1)
-        garch_gjr_results = arch_model(
-            training_set[asset].dropna(),
-            vol="GARCH",
-            p=1,
-            o=1,
-            q=1,
-            dist="Normal",
-            mean="Constant",
-        ).fit(disp="off")
-        # Fit EGARCH(1,1)
-        egarch_results = arch_model(
-            training_set[asset].dropna(),
-            vol="EGARCH",
-            p=1,
-            q=1,
-            dist="Normal",
-            mean="Constant",
-        ).fit(disp="off")
-        # Fit EGARCH(1,1)-GJR(1,1)
-        egarch_gjr_results = arch_model(
-            training_set[asset].dropna(),
-            vol="EGARCH",
-            p=1,
-            o=1,
-            q=1,
-            dist="Normal",
-            mean="Constant",
-        ).fit(disp="off")
         # Store results
-        results[asset] = {
-            "GARCH": garch_results,
-            "GARCH-GJR": garch_gjr_results,
-            "EGARCH": egarch_results,
-            "EGARCH-GJR": egarch_gjr_results,
-        }
+        results[asset] = fit_garch_models(training_set[asset])
 
     # ————————————————————————————————————————————
     # Plot conditional variances
@@ -371,20 +363,7 @@ def ewp_garch_diagnostics(
         Dictionary containing AIC and BIC for each model.
     """
 
-    results = {
-        "GARCH": arch_model(
-            ewp, vol="Garch", p=1, q=1, dist="Normal", mean="Constant"
-        ).fit(disp="off"),
-        "GARCH-GJR": arch_model(
-            ewp, vol="GARCH", p=1, o=1, q=1, dist="Normal", mean="Constant"
-        ).fit(disp="off"),
-        "EGARCH": arch_model(
-            ewp, vol="EGARCH", p=1, q=1, dist="Normal", mean="Constant"
-        ).fit(disp="off"),
-        "EGARCH-GJR": arch_model(
-            ewp, vol="EGARCH", p=1, o=1, q=1, dist="Normal", mean="Constant"
-        ).fit(disp="off"),
-    }
+    results = fit_garch_models(ewp)
 
     # Portfolio -> plotted singularly because this order is better for visualization
     plt.figure(figsize=(8, 5))
@@ -432,3 +411,173 @@ def ewp_garch_diagnostics(
 
 
 # ———————————————————————————————————————————————————————————————————————————————————————————————————————————————————————— #
+# Rolling Forecasts and VaR Computation Helpers
+
+
+def _make_model(y: pd.Series, model_name: str = "EGARCH", dist: str = "normal"):
+    dist = dist.lower()
+    if model_name.upper() == "GARCH":
+        return arch_model(y, mean="Constant", vol="GARCH", p=1, q=1, dist=dist)
+    elif model_name.upper() == "EGARCH":
+        return arch_model(y, mean="Constant", vol="EGARCH", p=1, q=1, dist=dist)
+    elif model_name.upper() == "GARCH-GJR":
+        return arch_model(y, mean="Constant", vol="GARCH", p=1, o=1, q=1, dist=dist)
+    elif model_name.upper() == "EGARCH-GJR":
+        return arch_model(y, mean="Constant", vol="EGARCH", p=1, o=1, q=1, dist=dist)
+    else:
+        raise ValueError("Unknown model_name")
+
+
+# ———————————————————————————————————————————————————————————————————————————————————————————————————————————————————————— #
+# Rolling Forecasts
+def rolling_forecast_sigma(
+    train_series: pd.Series,
+    test_series: pd.Series,
+    model_name: str = "EGARCH",
+    dist: str = "normal",
+    window: int | None = 1000,
+) -> Tuple[pd.Series, pd.Series]:
+    """
+    For each date in test_series, fit the model on past data up to t-1 and forecast t.
+    Returns two Series indexed by test_series.index: mu_hat and var_hat.
+    """
+    # Build a continuous series to slice by position safely
+    full = pd.concat([train_series, test_series]).dropna()
+    n_train = len(train_series)
+    test_dates = test_series.index
+    n_fore = len(test_dates)
+
+    mu_f = pd.Series(index=test_dates, dtype=float)
+    var_f = pd.Series(index=test_dates, dtype=float)
+
+    for i in range(n_fore):
+        end_pos = n_train + i  # position of day BEFORE the forecasted day
+        if window is None:
+            start_pos = 0
+        else:
+            start_pos = max(0, end_pos - window)
+
+        y_insample = full.iloc[start_pos:end_pos].dropna()
+        if len(y_insample) < 60:
+            mu_f.iloc[i] = np.nan
+            var_f.iloc[i] = np.nan
+            continue
+
+        try:
+            mdl = _make_model(y_insample, model_name=model_name, dist=dist)
+            res = mdl.fit(
+                disp="off", show_warning=False, tol=1e-6, options={"maxiter": 500}
+            )
+            fc = res.forecast(horizon=1, reindex=False)
+            mu_f.iloc[i] = float(fc.mean.values[-1, 0])
+            var_f.iloc[i] = float(fc.variance.values[-1, 0])
+        except Exception:
+            mu_f.iloc[i] = np.nan
+            var_f.iloc[i] = np.nan
+
+    return mu_f, var_f
+
+
+# ———————————————————————————————————————————————————————————————————————————————————————————————————————————————————————— #
+# Residual Distribution Fitting
+def fit_residual_distribution(
+    train_series: pd.Series, model_name: str = "EGARCH", dist_for_fit: str = "normal"
+) -> Dict[str, float]:
+    """
+    Fit the chosen GARCH on the training set with Normal innovations.
+    Extract standardized residuals z and test Normal vs. Student-t;
+    return estimated df for t and KS p-values.
+    """
+    out = {"df_t": np.nan, "ks_norm_p": np.nan, "ks_t_p": np.nan}
+    try:
+        mdl = _make_model(
+            train_series.dropna(), model_name=model_name, dist=dist_for_fit
+        )
+        res = mdl.fit(
+            disp="off", show_warning=False, tol=1e-6, options={"maxiter": 500}
+        )
+        z = pd.Series(res.std_resid).dropna().values
+
+        # estimate Student-t df on z (loc=0)
+        df_t, _, _ = t.fit(z, floc=0)
+        ks_norm_p = kstest(z, "norm", args=(np.mean(z), np.std(z, ddof=0))).pvalue
+        ks_t_p = kstest(z, "t", args=(df_t, 0, 1)).pvalue
+
+        out.update({"df_t": df_t, "ks_norm_p": ks_norm_p, "ks_t_p": ks_t_p})
+    except Exception:
+        pass
+    return out
+
+
+# ———————————————————————————————————————————————————————————————————————————————————————————————————————————————————————— #
+# VaR Computation
+
+
+def compute_VaR(
+    mu_fore: pd.Series | pd.DataFrame,
+    var_fore: pd.Series | pd.DataFrame,
+    alpha: float,
+    distribution: str = "normal",
+    df_param: float | pd.Series | None = None,
+):
+    """
+    Returns VaR as a positive number:  VaR = -(mu + sqrt(var) * q_alpha)
+    If distribution='student-t', df_param must be provided (float or per-date Series).
+    """
+    if isinstance(mu_fore, pd.Series):
+        mu = mu_fore
+        s = np.sqrt(var_fore)
+        if distribution == "normal":
+            q = norm.ppf(alpha)
+        elif distribution == "student-t":
+            if df_param is None:
+                raise ValueError("df_param required for student-t VaR")
+            if np.isscalar(df_param):
+                q = t.ppf(alpha, df_param)
+                return -(mu + s * q)
+            else:
+                # per-date df (rare here) — align index
+                df_param = pd.Series(df_param, index=mu.index)
+                q = df_param.apply(
+                    lambda nu: t.ppf(alpha, nu) if np.isfinite(nu) else norm.ppf(alpha)
+                )
+                return -(mu + s * q)
+        else:
+            raise ValueError("distribution must be 'normal' or 'student-t'")
+        return -(mu + s * q)
+
+    # DataFrame case: apply columnwise
+    out = pd.DataFrame(index=mu_fore.index, columns=mu_fore.columns, dtype=float)
+    for c in mu_fore.columns:
+        out[c] = compute_var(
+            mu_fore[c],
+            var_fore[c],
+            alpha,
+            distribution,
+            (
+                None
+                if (df_param is None or np.isscalar(df_param))
+                else df_param.get(c, np.nan)
+            ),
+        )
+    return out
+
+
+# ———————————————————————————————————————————————————————————————————————————————————————————————————————————————————————— #
+# Plotting Helpers
+
+
+def plot_var(dates, realized, var_norm, var_t, title, alpha):
+    plt.figure(figsize=(12, 5))
+    plt.plot(dates, realized.values, label="Realized returns", color="black", alpha=0.7)
+    plt.plot(dates, -var_norm, label=f"VaR Normal (α={alpha:.2f})", alpha=0.9)
+    plt.plot(
+        dates, -var_t, label=f"VaR t       (α={alpha:.2f})", linestyle="--", alpha=0.9
+    )
+    plt.axhline(0, color="gray", linestyle=":", linewidth=0.8)
+    plt.title(title)
+    plt.xlabel("Date")
+    plt.ylabel("Return / VaR")
+    plt.legend()
+    plt.tight_layout()
+    plt.show()
