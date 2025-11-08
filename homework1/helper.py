@@ -428,4 +428,7 @@ def ewp_garch_diagnostics(
     return {
         garch_model: [results[garch_model].aic, results[garch_model].bic]
         for garch_model in UNIVARIATE_GARCH_MODELS
-    }
+    }  # levereging dictionary comprehension because it looks nice
+
+
+# ———————————————————————————————————————————————————————————————————————————————————————————————————————————————————————— #
