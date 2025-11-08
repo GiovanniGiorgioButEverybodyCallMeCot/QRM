@@ -549,7 +549,7 @@ def compute_VaR(
     # DataFrame case: apply columnwise
     out = pd.DataFrame(index=mu_fore.index, columns=mu_fore.columns, dtype=float)
     for c in mu_fore.columns:
-        out[c] = compute_var(
+        out[c] = compute_VaR(
             mu_fore[c],
             var_fore[c],
             alpha,
