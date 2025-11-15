@@ -8,10 +8,10 @@ from scipy import stats
 from statsmodels.stats.diagnostic import acorr_ljungbox
 from statsmodels.graphics.tsaplots import plot_acf, plot_pacf
 from arch import arch_model
-from scipy.stats import t, kstest, norm
+from scipy.stats import t, kstest, norm, genextreme
 from typing import Tuple, Dict
 
-UNIVARIATE_GARCH_MODELS = ["GARCH", "GARCH-GJR", "EGARCH", "EGARCH-GJR"]
+UNIVARIATE_GARCH_MODELS = ["GARCH", "GARCH-GJR", "EGARCH", "APARCH"]
 
 # ——————————————————————————————————————————————————————————————————————————————————————————————————————————————————————— #
 # GARCH-Type Model Fitting Helper Function
@@ -31,8 +31,8 @@ def fit_garch_models(
     model_specs = {
         "GARCH": {"vol": "GARCH", "p": 1, "q": 1},
         "GARCH-GJR": {"vol": "GARCH", "p": 1, "o": 1, "q": 1},
-        "EGARCH": {"vol": "EGARCH", "p": 1, "q": 1},
-        "EGARCH-GJR": {"vol": "EGARCH", "p": 1, "o": 1, "q": 1},
+        "EGARCH": {"vol": "EGARCH", "p": 1, "o": 1, "q": 1},
+        "APARCH": {"vol": "APARCH", "p": 1, "o": 1, "q": 1},
     }
 
     # I know that fitting models one by one is more readable, but how cool is this dictionary comprehension?
@@ -50,7 +50,7 @@ def fit_garch_models(
 
 
 def visual_descriptive_statistics(
-    returns_df: pd.DataFrame, plot: bool = True, save: bool = True
+    returns_df: pd.DataFrame, plot: bool = False, save: bool = False
 ) -> pd.DataFrame:
     """
     Computes basic descriptive statistics and generates the following diagnostic plots for each asset's returns in the given DataFrame:
@@ -307,9 +307,9 @@ def univariate_garch_diagnostics(
             color="green",
         )
         axes[i].plot(
-            results[asset]["EGARCH-GJR"].conditional_volatility ** 2,
+            results[asset]["APARCH"].conditional_volatility ** 2,
             alpha=0.6,
-            label=f"EGARCH-GJR",
+            label=f"APARCH",
             color="yellow",
         )
         axes[i].plot(
@@ -380,9 +380,9 @@ def ewp_garch_diagnostics(
         color="green",
     )
     plt.plot(
-        results["EGARCH-GJR"].conditional_volatility ** 2,
+        results["APARCH"].conditional_volatility ** 2,
         alpha=0.7,
-        label="EGARCH-GJR",
+        label="APARCH",
         color="yellow",
     )
     plt.plot(
@@ -391,6 +391,7 @@ def ewp_garch_diagnostics(
         label="EGARCH",
         color="blue",
     )
+
     plt.title("Conditional Variance of Normal Garch (1,1) models - EWP")
     plt.xlabel("Date")
     plt.ylabel("Variance")
@@ -419,11 +420,11 @@ def _make_model(y: pd.Series, model_name: str = "EGARCH", dist: str = "normal"):
     if model_name.upper() == "GARCH":
         return arch_model(y, mean="Constant", vol="GARCH", p=1, q=1, dist=dist)
     elif model_name.upper() == "EGARCH":
-        return arch_model(y, mean="Constant", vol="EGARCH", p=1, q=1, dist=dist)
+        return arch_model(y, mean="Constant", vol="EGARCH", p=1, o=1, q=1, dist=dist)
     elif model_name.upper() == "GARCH-GJR":
         return arch_model(y, mean="Constant", vol="GARCH", p=1, o=1, q=1, dist=dist)
-    elif model_name.upper() == "EGARCH-GJR":
-        return arch_model(y, mean="Constant", vol="EGARCH", p=1, o=1, q=1, dist=dist)
+    elif model_name.upper() == "APARCH":
+        return arch_model(y, mean="Constant", vol="APARCH", p=1, o=1, q=1, dist=dist)
     else:
         raise ValueError("Unknown model_name")
 
@@ -445,12 +446,12 @@ def rolling_forecast_sigma(
     full = pd.concat([train_series, test_series]).dropna()
     n_train = len(train_series)
     test_dates = test_series.index
-    n_fore = len(test_dates)
+    n_forecast = len(test_dates)
 
     mu_f = pd.Series(index=test_dates, dtype=float)
     var_f = pd.Series(index=test_dates, dtype=float)
 
-    for i in range(n_fore):
+    for i in range(n_forecast):
         end_pos = n_train + i  # position of day BEFORE the forecasted day
         if window is None:
             start_pos = 0
@@ -487,6 +488,12 @@ def fit_residual_distribution(
     Fit the chosen GARCH on the training set with Normal innovations.
     Extract standardized residuals z and test Normal vs. Student-t;
     return estimated df for t and KS p-values.
+    Args:
+        train_series: Series of training returns.
+        model_name: GARCH-type model name.
+        dist_for_fit: Distribution for fitting the GARCH model.
+    Returns:
+        Dictionary with keys 'df_t', 'ks_norm_p', 'ks_t_p'.
     """
     out = {"df_t": np.nan, "ks_norm_p": np.nan, "ks_t_p": np.nan}
     try:
@@ -514,70 +521,227 @@ def fit_residual_distribution(
 
 
 def compute_VaR(
-    mu_fore: pd.Series | pd.DataFrame,
-    var_fore: pd.Series | pd.DataFrame,
+    mu_forecast: pd.Series | pd.DataFrame,
+    var_forecast: pd.Series | pd.DataFrame,
     alpha: float,
     distribution: str = "normal",
-    df_param: float | pd.Series | None = None,
+    df_param: float | dict | None = None,
 ):
     """
     Returns VaR as a positive number:  VaR = -(mu + sqrt(var) * q_alpha)
-    If distribution='student-t', df_param must be provided (float or per-date Series).
-    """
-    if isinstance(mu_fore, pd.Series):
-        mu = mu_fore
-        s = np.sqrt(var_fore)
-        if distribution == "normal":
-            q = norm.ppf(alpha)
-        elif distribution == "student-t":
-            if df_param is None:
-                raise ValueError("df_param required for student-t VaR")
-            if np.isscalar(df_param):
-                q = t.ppf(alpha, df_param)
-                return -(mu + s * q)
-            else:
-                # per-date df (rare here) — align index
-                df_param = pd.Series(df_param, index=mu.index)
-                q = df_param.apply(
-                    lambda nu: t.ppf(alpha, nu) if np.isfinite(nu) else norm.ppf(alpha)
-                )
-                return -(mu + s * q)
-        else:
-            raise ValueError("distribution must be 'normal' or 'student-t'")
-        return -(mu + s * q)
 
-    # DataFrame case: apply columnwise
-    out = pd.DataFrame(index=mu_fore.index, columns=mu_fore.columns, dtype=float)
-    for c in mu_fore.columns:
-        out[c] = compute_VaR(
-            mu_fore[c],
-            var_fore[c],
-            alpha,
-            distribution,
-            (
-                None
-                if (df_param is None or np.isscalar(df_param))
-                else df_param.get(c, np.nan)
-            ),
-        )
-    return out
+    Args:
+        mu_forecast: Series or DataFrame of forecasted means.
+        var_forecast: Series or DataFrame of forecasted variances.
+        alpha: Significance level for VaR.
+        distribution: 'normal' or 'student-t'.
+        df_param: Degrees of freedom for Student-t (float or dict mapping columns to df values).
+    Returns:
+        Series or DataFrame of VaR values.
+    """
+    s = np.sqrt(var_forecast)
+
+    if distribution == "normal":
+        q = norm.ppf(alpha)
+    elif distribution == "student-t":
+        if df_param is None:
+            raise ValueError("df_param required for student-t VaR")
+        if np.isscalar(df_param):
+            q = t.ppf(alpha, df_param)
+        else:
+            # dict case: create Series with appropriate alignment
+            if isinstance(mu_forecast, pd.DataFrame):
+                q = pd.Series(
+                    {
+                        col: t.ppf(alpha, df_param.get(col, np.nan))
+                        for col in mu_forecast.columns
+                    }
+                )
+            else:
+                q = t.ppf(alpha, df_param)
+    else:
+        raise ValueError("distribution must be 'normal' or 'student-t'")
+
+    return -(mu_forecast + s * q)
 
 
 # ———————————————————————————————————————————————————————————————————————————————————————————————————————————————————————— #
 # Plotting Helpers
 
 
-def plot_var(dates, realized, var_norm, var_t, title, alpha):
-    plt.figure(figsize=(12, 5))
-    plt.plot(dates, realized.values, label="Realized returns", color="black", alpha=0.7)
-    plt.plot(dates, -var_norm, label=f"VaR Normal (α={alpha:.2f})", alpha=0.9)
-    plt.plot(
-        dates, -var_t, label=f"VaR t       (α={alpha:.2f})", linestyle="--", alpha=0.9
-    )
-    plt.axhline(0, color="gray", linestyle=":", linewidth=0.8)
-    plt.title(title)
-    plt.xlabel("Date")
-    plt.ylabel("Return / VaR")
-    plt.legend()
+# Might've over-engineered this a bit, but now it accepts both single and multiple assets plotting and more alpha levels
+def plot_VaR_estimates(
+    dates: pd.DatetimeIndex,
+    realized: pd.Series | pd.DataFrame,
+    var_norm: pd.DataFrame,  # MultiIndex columns: (alpha, asset)
+    var_t: pd.DataFrame,  # MultiIndex columns: (alpha, asset)
+    assets: str | list[str] = None,
+) -> None:
+    """
+    Plot realized returns and VaR estimates (Normal and Student-t) over time.
+    Shows all alpha levels for each asset in the same subplot.
+
+    Args:
+        dates: DatetimeIndex for x-axis.
+        realized: Series or DataFrame of realized returns.
+        var_norm: DataFrame with MultiIndex columns (alpha, asset) of VaR estimates under Normal.
+        var_t: DataFrame with MultiIndex columns (alpha, asset) of VaR estimates under Student-t.
+        assets: Single asset name or list of asset names to plot. If None, plots all assets.
+    """
+    # Normalize realized to DataFrame
+    if isinstance(realized, pd.Series):
+        realized = realized.to_frame()
+    # Determine which assets to plot
+    if assets is None:
+        assets = realized.columns.tolist()
+    elif isinstance(assets, str):
+        assets = [assets]
+
+    n = len(assets)
+    alphas = var_norm.columns.get_level_values("alpha").unique().tolist()
+
+    # Subplot layout
+    ncols = 2 if n > 1 else 1
+    nrows = int(np.ceil(n / ncols))
+    # Create subplots
+    fig, axes = plt.subplots(nrows, ncols, figsize=(14, 4 * nrows))
+    axes = np.atleast_1d(axes).flatten()
+
+    # Define 3 colormaps that cycle
+    colormaps = [plt.cm.Blues, plt.cm.Oranges, plt.cm.Greens]
+
+    # Plot each asset
+    for i, asset in enumerate(assets):
+        ax = axes[i]
+
+        # Plot realized returns
+        ax.plot(
+            dates,
+            realized[asset],
+            color=".09",
+            lw=1.25,
+            alpha=0.8,
+            label="Realized returns",
+            zorder=10,
+        )
+
+        # Plot VaR for each alpha level
+        for j, alpha in enumerate(alphas):
+            # Assign colormap cyclically
+            cmap = colormaps[j % len(colormaps)]
+            color_norm = cmap(0.6)
+            color_t = cmap(0.8)
+
+            ax.plot(
+                dates,
+                -var_norm[alpha][asset],
+                color=color_norm,
+                lw=1.2,
+                linestyle="-",
+                label=f"VaR Normal (α={alpha:.2f})",
+            )
+            ax.plot(
+                dates,
+                -var_t[alpha][asset],
+                color=color_t,
+                lw=1.2,
+                linestyle="--",
+                label=f"VaR t (α={alpha:.2f})",
+            )
+
+        ax.axhline(0, color="gray", linestyle=":", lw=0.8)
+        ax.set_title(f"{asset}")
+        ax.set_ylabel("Return / VaR")
+
+        # x-labels only at bottom row
+        if i >= (nrows - 1) * ncols:
+            ax.set_xlabel("Date")
+
+        ax.legend(fontsize=8, loc="best", ncol=2)
+        ax.grid(True, alpha=0.3)
+
+    # Remove unused subplots
+    for j in range(i + 1, len(axes)):
+        fig.delaxes(axes[j])
+
     plt.tight_layout()
     plt.show()
+
+
+# ———————————————————————————————————————————————————————————————————————————————————————————————————————————————————————— #
+# Standardized Residual Diagnostics Plotting
+def plot_std_resid_diagnostics(Z=None, show: bool = True, save: bool = False) -> None:
+    """
+    Plot histogram+PDF fits (Normal, t, GEV) and QQ plots (3 panels) for standardized residuals Z.
+    Args:
+        Z: Series of standardized residuals.
+        show: Whether to display the plots.
+        save: Whether to save the plots as PNG files.
+    Returns:
+        None
+    """
+
+    # --- fit distributions ---
+    mu_hat = Z.mean()
+    sig_hat = Z.std(ddof=0)
+    df_hat, loc_t, scale_t = t.fit(Z, floc=0)
+    c_hat, loc_gev, scale_gev = genextreme.fit(Z)
+
+    params = {
+        "normal": {"mu": mu_hat, "sigma": sig_hat},
+        "t": {"df": df_hat, "loc": loc_t, "scale": scale_t},
+        "gev": {"c": c_hat, "loc": loc_gev, "scale": scale_gev},
+    }
+
+    # --- create figure layout ---
+    fig = plt.figure(figsize=(10, 8))
+    gs = fig.add_gridspec(2, 3, height_ratios=[1.2, 1])
+    ax_top = fig.add_subplot(gs[0, :])
+    ax1 = fig.add_subplot(gs[1, 0])
+    ax2 = fig.add_subplot(gs[1, 1])
+    ax3 = fig.add_subplot(gs[1, 2])
+
+    # --- histogram + PDFs ---
+    xs = np.linspace(Z.min(), Z.max(), 400)
+    ax_top.hist(Z, bins=120, density=True, alpha=0.5, label="Z histogram")
+    ax_top.plot(xs, norm.pdf(xs, mu_hat, sig_hat), label="Normal fit")
+    ax_top.plot(xs, t.pdf(xs, df_hat, loc_t, scale_t), label=f"t fit (df={df_hat:.1f})")
+    ax_top.plot(
+        xs,
+        genextreme.pdf(xs, c_hat, loc_gev, scale_gev),
+        label=f"GEV fit (c={c_hat:.2f})",
+    )
+    ax_top.set_title("Standardized residuals — histogram with fitted distributions")
+    ax_top.legend()
+
+    # --- local QQ helper ---
+    def qqplot(ax, sample, q_theor, title):
+        s = np.sort(sample)
+        q = np.sort(q_theor)
+        n = min(len(s), len(q))
+        ax.scatter(q[:n], s[:n], s=10, alpha=0.6)
+        lo, hi = min(q.min(), s.min()), max(q.max(), s.max())
+        ax.plot([lo, hi], [lo, hi], "k--", linewidth=1)
+        ax.set_title(title)
+
+    # --- QQ theoretical quantiles ---
+    n = len(Z)
+    p = (np.arange(1, n + 1) - 0.5) / n
+    q_norm = norm.ppf(p, mu_hat, sig_hat)
+    q_t = t.ppf(p, df_hat, loc_t, scale_t)
+    q_gev = genextreme.ppf(p, c_hat, loc_gev, scale_gev)
+
+    # --- QQ plots ---
+    qqplot(ax1, Z, q_norm, "QQ vs Normal")
+    qqplot(ax2, Z, q_t, "QQ vs Student-t")
+    qqplot(ax3, Z, q_gev, "QQ vs GEV")
+    plt.tight_layout()
+
+    if show:
+        plt.show()
+
+    if save:
+        plt.savefig("image/5/std_resid_diagnostics.png", dpi=300)
+
+
+# ———————————————————————————————————————————————————————————————————————————————————————————————————————————————————————— #
