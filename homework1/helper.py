@@ -10,6 +10,9 @@ from statsmodels.graphics.tsaplots import plot_acf, plot_pacf
 from arch import arch_model
 from scipy.stats import t, kstest, norm, genextreme
 from typing import Tuple, Dict
+from scipy.stats import genpareto
+
+# ——————————————————————————————————————————————————————————————————————————————————————————————————————————————————————— #
 
 UNIVARIATE_GARCH_MODELS = ["GARCH", "GARCH-GJR", "EGARCH", "APARCH"]
 
@@ -745,3 +748,514 @@ def plot_std_resid_diagnostics(Z=None, show: bool = True, save: bool = False) ->
 
 
 # ———————————————————————————————————————————————————————————————————————————————————————————————————————————————————————— #
+def ferro_segers_theta(series: pd.Series, upper_quantile: float = 0.95) -> float:
+    """
+    Estimate extremal index θ using Ferro-Segers-style approach.
+
+    Args:
+        series: Time series of data (e.g., standardized residuals)
+        upper_quantile: Threshold quantile for exceedances (default: 0.95)
+
+    Returns:
+        Estimated extremal index θ ∈ (0, 1]
+    """
+    u = series.quantile(upper_quantile)
+    exc_idx = series[series > u].index
+
+    if len(exc_idx) < 2:
+        return 1.0
+
+    # Convert datetime index to day counts
+    if isinstance(exc_idx, pd.DatetimeIndex):
+        inter_days = exc_idx.to_series().diff().dt.total_seconds().dropna() / 86400.0
+    else:
+        inter_days = pd.Series(np.diff(np.asarray(exc_idx, dtype=float)))
+
+    if len(inter_days) == 0:
+        return 1.0
+
+    m = inter_days.mean()
+    v = inter_days.var(ddof=1) if len(inter_days) > 1 else 0.0
+
+    # Ferro-Segers shrinkage to [0,1]
+    theta = m / (m + (v / max(m, 1e-12)))
+    return float(np.clip(theta, 0.01, 1.0))
+
+
+# ———————————————————————————————————————————————————————————————————————————————————————————————————————————————————————— #
+
+
+def fit_gev_tail(
+    returns: pd.Series, model_name: str, dist: str, upper_quantile: float = 0.95
+) -> dict:
+    """
+    Fit GEV to monthly block maxima of standardized residuals (left tail).
+
+    Args:
+        returns: Time series of returns
+        model_name: GARCH model name (e.g., 'GARCH')
+        dist: Distribution for GARCH (e.g., 'normal')
+        upper_quantile: Quantile for extremal index estimation
+
+    Returns:
+        Dictionary with GEV parameters, extremal index, and block info
+    """
+    # Fit GARCH model to get standardized residuals
+    mdl = _make_model(returns, model_name=model_name, dist=dist)
+    res = mdl.fit(disp="off", show_warning=False, tol=1e-6, options={"maxiter": 500})
+    Z = pd.Series(res.std_resid, index=returns.index).dropna()
+
+    # Left tail analysis: Y = -Z (large Y = large losses)
+    Y = -Z
+
+    # Monthly block maxima
+    Y_mmax = Y.resample("M").max().dropna()
+    block_sizes = Y.resample("M").size()
+    n_days_block = int(block_sizes.median())
+
+    # Fit GEV to block maxima
+    c_hat, loc_hat, scale_hat = genextreme.fit(Y_mmax.values)
+
+    # Estimate extremal index
+    theta_hat = ferro_segers_theta(Y, upper_quantile=upper_quantile)
+
+    return {
+        "gev_shape": c_hat,
+        "gev_loc": loc_hat,
+        "gev_scale": scale_hat,
+        "theta": theta_hat,
+        "n_blocks": len(Y_mmax),
+        "n_days_block": n_days_block,
+        "Y_mmax": Y_mmax,  # For QQ plots
+    }
+
+
+# ———————————————————————————————————————————————————————————————————————————————————————————————————————————————————————— #
+
+
+def compute_gev_var(
+    mu: pd.Series, sigma2: pd.Series, alpha: float, gev_params: dict
+) -> tuple[pd.Series, pd.Series]:
+    """
+    Compute VaR using GEV tail model with and without extremal index.
+
+    Args:
+        mu: Conditional mean forecasts
+        sigma2: Conditional variance forecasts
+        alpha: Confidence level (e.g., 0.05)
+        gev_params: Dictionary with GEV fit results
+
+    Returns:
+        Tuple of (VaR_independent, VaR_with_theta)
+    """
+    c, loc, scale = (
+        gev_params["gev_shape"],
+        gev_params["gev_loc"],
+        gev_params["gev_scale"],
+    )
+    theta = gev_params["theta"]
+    n_days = gev_params["n_days_block"]
+
+    # Map daily α-quantile via block GEV
+    p_block_ind = (1.0 - alpha) ** n_days
+    p_block_theta = (1.0 - alpha) ** (n_days * theta)
+
+    y_alpha_ind = genextreme.ppf(p_block_ind, c, loc, scale)
+    y_alpha_theta = genextreme.ppf(p_block_theta, c, loc, scale)
+
+    # Convert to residual quantiles: q_Z(α) = -y_alpha
+    qZ_ind = -y_alpha_ind
+    qZ_theta = -y_alpha_theta
+
+    # VaR = -(μ + σ * q_Z)
+    sigma = np.sqrt(sigma2)
+    VaR_ind = -(mu + sigma * qZ_ind)
+    VaR_theta = -(mu + sigma * qZ_theta)
+
+    return VaR_ind, VaR_theta
+
+
+# ———————————————————————————————————————————————————————————————————————————————————————————————————————————————————————— #
+
+
+def plot_gev_var(
+    dates: pd.DatetimeIndex,
+    realized: pd.DataFrame,
+    gev_fits: dict,
+    var_gev: pd.DataFrame,  # MultiIndex: (alpha, asset, theta_type)
+    assets: str | list[str] = None,
+) -> None:
+    """
+    Plot realized returns vs GEV-based VaR (with/without extremal index).
+    Shows all alpha levels for each asset in subplots.
+    Args:
+        dates: DatetimeIndex for x-axis.
+        realized: DataFrame of realized returns.
+        var_gev: DataFrame with MultiIndex columns (alpha, asset, theta_type) of VaR estimates.
+    """
+    if isinstance(realized, pd.Series):
+        realized = realized.to_frame()
+
+    if assets is None:
+        assets = realized.columns.tolist()
+    elif isinstance(assets, str):
+        assets = [assets]
+
+    n = len(assets)
+    alphas = var_gev.columns.get_level_values("alpha").unique().tolist()
+
+    # Subplot layout
+    ncols = 2 if n > 1 else 1
+    nrows = int(np.ceil(n / ncols))
+    fig, axes = plt.subplots(nrows, ncols, figsize=(14, 4 * nrows))
+    axes = np.atleast_1d(axes).flatten()
+
+    colormaps = [plt.cm.Purples, plt.cm.Oranges, plt.cm.Greens]
+
+    for i, asset in enumerate(assets):
+        ax = axes[i]
+
+        # Plot realized returns
+        ax.plot(
+            dates,
+            realized[asset],
+            color=".09",
+            lw=1.25,
+            alpha=0.8,
+            label="Realized returns",
+            zorder=10,
+        )
+
+        # Plot VaR for each alpha
+        for j, alpha in enumerate(alphas):
+            cmap = colormaps[j % len(colormaps)]
+            color_ind = cmap(0.6)
+            color_theta = cmap(0.8)
+
+            ax.plot(
+                dates,
+                -var_gev[alpha, asset, "independent"],
+                color=color_ind,
+                lw=1.2,
+                linestyle="-",
+                label=f"VaR GEV (θ=1, α={alpha:.2f})",
+            )
+            ax.plot(
+                dates,
+                -var_gev[alpha, asset, "with_theta"],
+                color=color_theta,
+                lw=1.2,
+                linestyle="--",
+                label=f"VaR GEV (θ={gev_fits[asset]['theta']:.2f}, α={alpha:.2f})",
+            )
+
+        ax.axhline(0, color="gray", linestyle=":", lw=0.8)
+        ax.set_title(f"{asset}")
+        ax.set_ylabel("Return / VaR")
+
+        if i >= (nrows - 1) * ncols:
+            ax.set_xlabel("Date")
+
+        ax.legend(fontsize=8, loc="best", ncol=2)
+        ax.grid(True, alpha=0.3)
+
+    # Remove unused subplots
+    for j in range(i + 1, len(axes)):
+        fig.delaxes(axes[j])
+
+    plt.tight_layout()
+    plt.show()
+
+
+# ———————————————————————————————————————————————————————————————————————————————————————————————————————————————————————— #
+
+
+def plot_gev_diagnostics(gev_fits: dict, assets: list[str] = None) -> None:
+    """
+    QQ-plots for GEV fit diagnostics (monthly block maxima).
+    Args:
+        gev_fits: Dictionary with GEV fit results.
+        assets: List of assets to plot. If None, plots all assets.
+    """
+    if assets is None:
+        assets = list(gev_fits.keys())
+    elif isinstance(assets, str):
+        assets = [assets]
+
+    n = len(assets)
+    ncols = 2
+    nrows = int(np.ceil(n / ncols))
+    fig, axes = plt.subplots(nrows, ncols, figsize=(10, 4 * nrows))
+    axes = np.atleast_1d(axes).flatten()
+
+    for i, asset in enumerate(assets):
+        ax = axes[i]
+        fit = gev_fits[asset]
+
+        Y_mmax_sorted = np.sort(fit["Y_mmax"].values)
+        n_blocks = fit["n_blocks"]
+        u = (np.arange(1, n_blocks + 1) - 0.5) / n_blocks
+        gev_q = genextreme.ppf(u, fit["gev_shape"], fit["gev_loc"], fit["gev_scale"])
+
+        ax.scatter(gev_q, Y_mmax_sorted, s=18, alpha=0.7, color="steelblue")
+        lo = min(gev_q.min(), Y_mmax_sorted.min())
+        hi = max(gev_q.max(), Y_mmax_sorted.max())
+        ax.plot([lo, hi], [lo, hi], "k--", lw=1)
+
+        ax.set_title(f"{asset} — GEV QQ-plot")
+        ax.set_xlabel("GEV quantiles")
+        ax.set_ylabel("Empirical block maxima")
+        ax.grid(True, alpha=0.3)
+
+    for j in range(i + 1, len(axes)):
+        fig.delaxes(axes[j])
+
+    plt.tight_layout()
+    plt.show()
+
+
+# ———————————————————————————————————————————————————————————————————————————————————————————————————————————————————————— #
+
+
+def fit_gpd_tail(
+    returns: pd.Series,
+    model_name: str,
+    dist: str,
+    threshold_quantile: float = 0.95,
+    upper_quantile: float = 0.95,
+) -> dict:
+    """
+    Fit GPD to peaks over threshold of standardized residuals (left tail).
+
+    Args:
+        returns: Time series of returns
+        model_name: GARCH model name (e.g., 'GARCH')
+        dist: Distribution for GARCH (e.g., 'normal')
+        threshold_quantile: Quantile for POT threshold (default: 0.95)
+        upper_quantile: Quantile for extremal index estimation
+
+    Returns:
+        Dictionary with GPD parameters, extremal index, and threshold info
+    """
+    # Fit GARCH model to get standardized residuals
+    mdl = help._make_model(returns, model_name=model_name, dist=dist)
+    res = mdl.fit(disp="off", show_warning=False, tol=1e-6, options={"maxiter": 500})
+    Z = pd.Series(res.std_resid, index=returns.index).dropna()
+
+    # Left tail analysis: Y = -Z (large Y = large losses)
+    Y = -Z
+
+    # POT: threshold and excesses
+    u = Y.quantile(threshold_quantile)
+    exceed = Y[Y > u]
+    excess = exceed - u
+
+    n = len(Y)
+    n_exc = len(exceed)
+    p_u = n_exc / n  # empirical exceedance probability
+
+    if n_exc < 30:
+        print(f"  Warning: Only {n_exc} exceedances — estimates may be unstable")
+
+    # Fit GPD to excesses (loc=0 for excesses)
+    xi_hat, loc_hat, beta_hat = genpareto.fit(excess.values, floc=0.0)
+
+    # Estimate extremal index
+    theta_hat = help.ferro_segers_theta(Y, upper_quantile=upper_quantile)
+
+    return {
+        "gpd_xi": xi_hat,
+        "gpd_beta": beta_hat,
+        "threshold": u,
+        "threshold_quantile": threshold_quantile,
+        "p_u": p_u,
+        "n_exceedances": n_exc,
+        "theta": theta_hat,
+        "excess_data": excess,  # For diagnostics
+    }
+
+
+# ———————————————————————————————————————————————————————————————————————————————————————————————————————————————————————— #
+
+
+def compute_gpd_var(
+    mu: pd.Series, sigma2: pd.Series, alpha: float, gpd_params: dict
+) -> tuple[pd.Series, pd.Series]:
+    """
+    Compute VaR using GPD tail model with and without extremal index.
+
+    Args:
+        mu: Conditional mean forecasts
+        sigma2: Conditional variance forecasts
+        alpha: Confidence level (e.g., 0.05)
+        gpd_params: Dictionary with GPD fit results
+
+    Returns:
+        Tuple of (VaR_independent, VaR_with_theta)
+    """
+    u = gpd_params["threshold"]
+    p_u = gpd_params["p_u"]
+    xi = gpd_params["gpd_xi"]
+    beta = gpd_params["gpd_beta"]
+    theta = gpd_params["theta"]
+
+    # GPD quantile function for Y (right tail)
+    def gpd_quantile(alpha_tail, theta_val=1.0):
+        p_eff = max(theta_val * p_u, 1e-12)
+        r = max(alpha_tail / p_eff, 1e-12)
+
+        if abs(xi) < 1e-8:  # Exponential limit
+            return u + beta * np.log(1.0 / r)
+        else:
+            return u + (beta / xi) * (r ** (-xi) - 1.0)
+
+    # Compute Y quantiles (right tail), then map to Z: q_Z(α) = -y_alpha
+    y_alpha_ind = gpd_quantile(alpha, theta_val=1.0)
+    y_alpha_theta = gpd_quantile(alpha, theta_val=theta)
+
+    qZ_ind = -y_alpha_ind
+    qZ_theta = -y_alpha_theta
+
+    # VaR = -(μ + σ * q_Z)
+    sigma = np.sqrt(sigma2)
+    VaR_ind = -(mu + sigma * qZ_ind)
+    VaR_theta = -(mu + sigma * qZ_theta)
+
+    return VaR_ind, VaR_theta
+
+
+# ———————————————————————————————————————————————————————————————————————————————————————————————————————————————————————— #
+
+
+def plot_gpd_var(
+    dates: pd.DatetimeIndex,
+    realized: pd.DataFrame,
+    gpd_fits: dict,
+    var_gpd: pd.DataFrame,  # MultiIndex: (alpha, asset, theta_type)
+    assets: str | list[str] = None,
+) -> None:
+    """
+    Plot realized returns vs GPD-based VaR (with/without extremal index).
+    Shows all alpha levels for each asset in subplots.
+    """
+    if isinstance(realized, pd.Series):
+        realized = realized.to_frame()
+
+    if assets is None:
+        assets = realized.columns.tolist()
+    elif isinstance(assets, str):
+        assets = [assets]
+
+    n = len(assets)
+    alphas = var_gpd.columns.get_level_values("alpha").unique().tolist()
+
+    # Subplot layout
+    ncols = 2 if n > 1 else 1
+    nrows = int(np.ceil(n / ncols))
+    fig, axes = plt.subplots(nrows, ncols, figsize=(14, 4 * nrows))
+    axes = np.atleast_1d(axes).flatten()
+
+    colormaps = [plt.cm.Reds, plt.cm.Blues, plt.cm.Greens]
+
+    for i, asset in enumerate(assets):
+        ax = axes[i]
+
+        # Plot realized returns
+        ax.plot(
+            dates,
+            realized[asset],
+            color=".09",
+            lw=1.25,
+            alpha=0.8,
+            label="Realized returns",
+            zorder=10,
+        )
+
+        # Plot VaR for each alpha
+        for j, alpha in enumerate(alphas):
+            cmap = colormaps[j % len(colormaps)]
+            color_ind = cmap(0.6)
+            color_theta = cmap(0.8)
+
+            ax.plot(
+                dates,
+                -var_gpd.loc[:, (alpha, asset, "independent")],
+                color=color_ind,
+                lw=1.2,
+                linestyle="-",
+                label=f"VaR GPD (θ=1, α={alpha:.2f})",
+            )
+            ax.plot(
+                dates,
+                -var_gpd.loc[:, (alpha, asset, "with_theta")],
+                color=color_theta,
+                lw=1.2,
+                linestyle="--",
+                label=f"VaR GPD (θ={gpd_fits[asset]['theta']:.2f}, α={alpha:.2f})",
+            )
+
+        ax.axhline(0, color="gray", linestyle=":", lw=0.8)
+        ax.set_title(f"{asset}")
+        ax.set_ylabel("Return / VaR")
+
+        if i >= (nrows - 1) * ncols:
+            ax.set_xlabel("Date")
+
+        ax.legend(fontsize=8, loc="best", ncol=2)
+        ax.grid(True, alpha=0.3)
+
+    # Remove unused subplots
+    for j in range(i + 1, len(axes)):
+        fig.delaxes(axes[j])
+
+    plt.tight_layout()
+    plt.show()
+
+
+# ———————————————————————————————————————————————————————————————————————————————————————————————————————————————————————— #
+
+
+def plot_gpd_diagnostics(gpd_fits: dict, assets: list[str] = None) -> None:
+    """
+    QQ-plots for GPD fit diagnostics (excesses over threshold).
+    """
+    if assets is None:
+        assets = list(gpd_fits.keys())
+    elif isinstance(assets, str):
+        assets = [assets]
+
+    n = len(assets)
+    ncols = 2
+    nrows = int(np.ceil(n / ncols))
+    fig, axes = plt.subplots(nrows, ncols, figsize=(10, 4 * nrows))
+    axes = np.atleast_1d(axes).flatten()
+
+    for i, asset in enumerate(assets):
+        ax = axes[i]
+        fit = gpd_fits[asset]
+
+        # Sort excesses
+        excess_sorted = np.sort(fit["excess_data"].values)
+        n_exc = len(excess_sorted)
+
+        # Empirical probabilities
+        u = (np.arange(1, n_exc + 1) - 0.5) / n_exc
+
+        # GPD theoretical quantiles
+        gpd_q = genpareto.ppf(u, fit["gpd_xi"], loc=0, scale=fit["gpd_beta"])
+
+        ax.scatter(gpd_q, excess_sorted, s=18, alpha=0.7, color="coral")
+        lo = min(gpd_q.min(), excess_sorted.min())
+        hi = max(gpd_q.max(), excess_sorted.max())
+        ax.plot([lo, hi], [lo, hi], "k--", lw=1)
+
+        ax.set_title(f"{asset} — GPD QQ-plot (excesses)")
+        ax.set_xlabel("GPD quantiles")
+        ax.set_ylabel("Empirical excesses")
+        ax.grid(True, alpha=0.3)
+
+    for j in range(i + 1, len(axes)):
+        fig.delaxes(axes[j])
+
+    plt.tight_layout()
+    plt.show()
