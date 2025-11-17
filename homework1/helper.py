@@ -95,16 +95,16 @@ def visual_descriptive_statistics(
     plt.xticks(rotation=45, ha="right", fontsize=9, weight="medium")
     plt.yticks(rotation=0, fontsize=9, weight="medium")
     plt.tight_layout()
-    if plot:
-        plt.show()
     if save:
         plt.savefig("images/correlation_matrix_returns.png", dpi=300)
-
+    if plot:
+        plt.show()
+    plt.close()
     # ————————————————————————————————————————————
     # Plot Histograms with Normal Fit and QQ-Plots
     # ————————————————————————————————————————————
 
-    _, axes = plt.subplots(
+    fig, axes = plt.subplots(
         nrows=len(assets), ncols=2, figsize=(12, 3 * len(assets))
     )  # height scales with number of assets
 
@@ -125,11 +125,12 @@ def visual_descriptive_statistics(
         plt.savefig("images/histogram_qqplots.png", dpi=300)
     if plot:
         plt.show()
+    plt.close(fig)
 
     # ————————————————————————————————————————————
     # Plot ACF of Returns and Squared Returns
     # ————————————————————————————————————————————
-    _, axes_acf = plt.subplots(
+    fig, axes_acf = plt.subplots(
         nrows=len(assets), ncols=2, figsize=(12, 3 * len(assets)), squeeze=False
     )
     for i, col in enumerate(assets):
@@ -146,11 +147,12 @@ def visual_descriptive_statistics(
         plt.savefig("images/acf_r_r2.png", dpi=300)
     if plot:
         plt.show()
+    plt.close(fig)
 
     # ————————————————————————————————————————————
     # Plot PACF of Returns and Squared Returns
     # ————————————————————————————————————————————
-    _, axes_pacf = plt.subplots(
+    fig, axes_pacf = plt.subplots(
         nrows=len(assets), ncols=2, figsize=(12, 3 * len(assets)), squeeze=False
     )
     for i, col in enumerate(assets):
@@ -167,6 +169,7 @@ def visual_descriptive_statistics(
         plt.savefig("images/pacf_r_r2.png", dpi=300)
     if plot:
         plt.show()
+    plt.close(fig)
 
     # ————————————————————————————————————————————
     # Compute and Plot Rolling Moments
@@ -181,7 +184,7 @@ def visual_descriptive_statistics(
     }
 
     # Plot rolling moments
-    _, axes = plt.subplots(4, 1, figsize=(14, 14))
+    fig, axes = plt.subplots(4, 1, figsize=(14, 14))
     for col in returns_df.columns:
         axes[0].plot(rolling["mean"].index, rolling["mean"][col], lw=1, alpha=0.6)
         axes[1].plot(rolling["var"].index, rolling["var"][col], lw=1.5, alpha=0.65)
@@ -205,6 +208,7 @@ def visual_descriptive_statistics(
         plt.savefig("images/rolling_moments.png", dpi=300)
     if plot:
         plt.show()
+    plt.close(fig)
 
     # ————————————————————————————————————————————
     # Plot Highest Rolling Correlation Between Any Two Assets
@@ -233,6 +237,7 @@ def visual_descriptive_statistics(
         plt.savefig("images/highest_rolling_correlation.png", dpi=300)
     if plot:
         plt.show()
+    plt.close()
 
     # ————————————————————————————————————————————
     # Descriptive Statistics DataFrame
@@ -291,7 +296,7 @@ def univariate_garch_diagnostics(
     # ————————————————————————————————————————————
 
     n_rows = (len(training_set.columns) + 1) // 2
-    _, axes = plt.subplots(n_rows, 2, figsize=(14, 3 * n_rows))
+    fig, axes = plt.subplots(n_rows, 2, figsize=(14, 3 * n_rows))
     axes = axes.flatten()  # Flatten to index easily on 1D
 
     for i, asset in enumerate(training_set.columns):
@@ -331,6 +336,7 @@ def univariate_garch_diagnostics(
         plt.savefig("images/garch_model_comparison.png", dpi=300)
     if plot:
         plt.show()
+    plt.close(fig)
 
     # ————————————————————————————————————————————————————————
     # Compute average AIC and BIC across assets for each model
@@ -402,6 +408,7 @@ def ewp_garch_diagnostics(
         plt.savefig("images/ewp_garch_model_comparison.png", dpi=300)
     if plot:
         plt.show()
+    plt.close()
 
     if print_summaries:
         for garch_model in UNIVARIATE_GARCH_MODELS:
@@ -959,6 +966,12 @@ def plot_extreme_var(
     Plot realized returns vs extreme value VaR (with/without extremal index).
     Shows all alpha levels for each asset in subplots.
     Works for both GEV and GPD methods.
+    Args:
+        dates: DatetimeIndex for x-axis.
+        realized: DataFrame of realized returns.
+        extreme_fits: Dict mapping asset names to fit results from fit_extreme_tail()
+        var_extreme: DataFrame with MultiIndex columns (alpha, asset, theta_type) of VaR estimates.
+        assets: Single asset name or list of asset names to plot. If None, plots all assets.
     """
     if isinstance(realized, pd.Series):
         realized = realized.to_frame()
@@ -1048,6 +1061,9 @@ def plot_extreme_diagnostics(extreme_fits: dict, assets: list[str] = None) -> No
     """
     QQ-plots for extreme value fit diagnostics.
     Works for both GEV (block maxima) and GPD (excesses).
+    Args:
+        extreme_fits: Dict mapping asset names to fit results from fit_extreme_tail()
+        assets: List of asset names to plot. If None, plots all assets.
     """
     if assets is None:
         assets = list(extreme_fits.keys())
@@ -1099,6 +1115,604 @@ def plot_extreme_diagnostics(extreme_fits: dict, assets: list[str] = None) -> No
         ax.set_ylabel(ylabel)
         ax.grid(True, alpha=0.3)
 
+    for j in range(i + 1, len(axes)):
+        fig.delaxes(axes[j])
+
+    plt.tight_layout()
+    plt.show()
+
+
+# ———————————————————————————————————————————————————————————————————————————————————————————————————————————————————————— #
+
+
+def fit_evt_params_insample(
+    returns: pd.Series,
+    model_name: str,
+    dist: str,
+    threshold_quantile: float = 0.95,
+    block_freq: str = "M",
+) -> dict:
+    """
+    Fit both GEV and GPD parameters in-sample for EVT-GARCH VaR.
+    Args:
+        returns: Time series of returns
+        model_name: GARCH model name (e.g., 'GARCH')
+        dist: Distribution for GARCH (e.g., 'normal')
+        threshold_quantile: Quantile for POT threshold (GPD)
+        block_freq: Frequency for block maxima (GEV), e.g., 'M' for monthly
+    Returns:
+        Dict with 'GEV' and 'GPD' parameters including extremal index θ
+    """
+    # Get standardized residuals
+    mdl = _make_model(returns, model_name=model_name, dist=dist)
+    res = mdl.fit(disp="off", show_warning=False, tol=1e-6, options={"maxiter": 500})
+    Z = pd.Series(res.std_resid, index=returns.index).dropna()
+    Y = -Z  # Left tail of Z → right tail of Y
+
+    # Extremal index
+    theta_hat = ferro_segers_theta(Y, upper_quantile=0.95)
+
+    # GEV: Block maxima
+    Y_mmax = Y.resample(block_freq).max().dropna()
+    if len(Y_mmax) < 6:
+        Y_mmax = Y.rolling(22, min_periods=1).max().dropna()
+
+    block_sizes = Y.resample(block_freq).size()
+    n_days_block = int(max(1, block_sizes.median()))
+    c_hat, loc_hat, scale_hat = genextreme.fit(Y_mmax.values)
+
+    # GPD: Peaks over threshold
+    u = Y.quantile(threshold_quantile)
+    exceed = Y[Y > u]
+    excess = (exceed - u).values
+    p_u = len(exceed) / max(1, len(Y))
+
+    if len(exceed) >= 20:
+        xi_hat, _, beta_hat = genpareto.fit(excess, floc=0.0)
+    else:
+        xi_hat, beta_hat = 0.0, (excess.mean() if len(exceed) > 0 else 1.0)
+
+    return {
+        "GEV": {
+            "c": c_hat,
+            "loc": loc_hat,
+            "scale": scale_hat,
+            "n_block": n_days_block,
+            "theta": theta_hat,
+        },
+        "GPD": {
+            "u": float(u),
+            "p_u": float(p_u),
+            "xi": float(xi_hat),
+            "beta": float(beta_hat),
+            "theta": theta_hat,
+        },
+    }
+
+
+def compute_evt_garch_var(
+    mu: pd.Series,
+    sigma2: pd.Series,
+    alpha: float,
+    evt_params: dict,
+) -> tuple[pd.Series, pd.Series, pd.Series]:
+    """
+    Compute VaR combining in-sample EVT quantiles with GARCH forecasts.
+    Args:
+        mu: Series of conditional mean forecasts.
+        sigma2: Series of conditional variance forecasts.
+        alpha: Significance level for VaR.
+        evt_params: Dict with in-sample EVT fit parameters ('GEV' and 'G
+    Returns:
+        Tuple of (Case3_GEV_ind, Case4_GEV_theta, Case5_GPD_ind)
+    """
+    sigma = np.sqrt(sigma2)
+
+    # Case 3: GEV independent (θ=1)
+    gev_params = evt_params["GEV"]
+    p_ind = (1.0 - alpha) ** gev_params["n_block"]
+    y_alpha_ind = genextreme.ppf(
+        p_ind, gev_params["c"], gev_params["loc"], gev_params["scale"]
+    )
+    qZ_gev_ind = -y_alpha_ind
+    VaR_case3 = -(mu + sigma * qZ_gev_ind)
+
+    # Case 4: GEV with extremal index
+    p_theta = (1.0 - alpha) ** (gev_params["n_block"] * gev_params["theta"])
+    y_alpha_theta = genextreme.ppf(
+        p_theta, gev_params["c"], gev_params["loc"], gev_params["scale"]
+    )
+    qZ_gev_theta = -y_alpha_theta
+    VaR_case4 = -(mu + sigma * qZ_gev_theta)
+
+    # Case 5: GPD independent (θ=1)
+    gpd_params = evt_params["GPD"]
+    p_eff = max(gpd_params["p_u"], 1e-12)
+    r = max(alpha / p_eff, 1e-12)
+
+    if abs(gpd_params["xi"]) < 1e-8:
+        y_alpha_gpd = gpd_params["u"] + gpd_params["beta"] * np.log(1.0 / r)
+    else:
+        y_alpha_gpd = gpd_params["u"] + (gpd_params["beta"] / gpd_params["xi"]) * (
+            r ** (-gpd_params["xi"]) - 1.0
+        )
+
+    qZ_gpd_ind = -y_alpha_gpd
+    VaR_case5 = -(mu + sigma * qZ_gpd_ind)
+
+    return VaR_case3, VaR_case4, VaR_case5
+
+
+# ———————————————————————————————————————————————————————————————————————————————————————————————————————————————————————— #
+
+
+def plot_evt_garch_var(
+    dates: pd.DatetimeIndex,
+    realized: pd.DataFrame,
+    evt_fits: dict,
+    var_evt: pd.DataFrame,  # MultiIndex: (alpha, asset, case)
+    assets: str | list[str] = None,
+) -> None:
+    """
+    Plot realized returns vs EVT-GARCH VaR (Cases 3-5).
+    Works for both GEV and GPD methods.
+    Args:
+        dates: DatetimeIndex for x-axis.
+        realized: Series or DataFrame of realized returns.
+        evt_fits: Dict of in-sample EVT fit parameters per asset.
+        var_evt: DataFrame with MultiIndex columns (alpha, asset, case) of VaR estimates.
+        assets: Single asset name or list of asset names to plot. If None, plots all assets.
+    """
+    if isinstance(realized, pd.Series):
+        realized = realized.to_frame()
+
+    if assets is None:
+        assets = realized.columns.tolist()
+    elif isinstance(assets, str):
+        assets = [assets]
+
+    n = len(assets)
+    alphas = var_evt.columns.get_level_values("alpha").unique().tolist()
+
+    # Subplot layout
+    ncols = 2 if n > 1 else 1
+    nrows = int(np.ceil(n / ncols))
+    fig, axes = plt.subplots(nrows, ncols, figsize=(14, 4 * nrows))
+    axes = np.atleast_1d(axes).flatten()
+
+    colormaps = [plt.cm.Blues, plt.cm.Oranges, plt.cm.Greens]
+
+    for i, asset in enumerate(assets):
+        ax = axes[i]
+
+        # Realized returns
+        ax.plot(
+            dates,
+            realized[asset],
+            color=".09",
+            lw=1.25,
+            alpha=0.8,
+            label="Realized returns",
+            zorder=10,
+        )
+
+        # Plot VaR for each alpha
+        for j, alpha in enumerate(alphas):
+            cmap = colormaps[j % len(colormaps)]
+            theta_val = evt_fits[asset]["GEV"]["theta"]
+
+            ax.plot(
+                dates,
+                -var_evt.loc[:, (alpha, asset, "case3")],
+                color=cmap(0.5),
+                lw=1.2,
+                linestyle="-",
+                label=f"GEV θ=1 (α={alpha:.2f})",
+            )
+            ax.plot(
+                dates,
+                -var_evt.loc[:, (alpha, asset, "case4")],
+                color=cmap(0.7),
+                lw=1.2,
+                linestyle="--",
+                label=f"GEV θ={theta_val:.2f} (α={alpha:.2f})",
+            )
+            ax.plot(
+                dates,
+                -var_evt.loc[:, (alpha, asset, "case5")],
+                color=cmap(0.9),
+                lw=1.2,
+                linestyle=":",
+                label=f"GPD θ=1 (α={alpha:.2f})",
+            )
+
+        ax.axhline(0, color="gray", linestyle=":", lw=0.8)
+        ax.set_title(f"{asset}")
+        ax.set_ylabel("Return / VaR")
+
+        if i >= (nrows - 1) * ncols:
+            ax.set_xlabel("Date")
+
+        ax.legend(fontsize=7, loc="best", ncol=1)
+        ax.grid(True, alpha=0.3)
+
+    # Remove unused subplots
+    for j in range(i + 1, len(axes)):
+        fig.delaxes(axes[j])
+
+    plt.tight_layout()
+    plt.show()
+
+
+# ———————————————————————————————————————————————————————————————————————————————————————————————————————————————————————— #
+
+
+def compute_var_breaches(
+    realized: pd.DataFrame,
+    var_dict: dict,  # Keys: method names, Values: MultiIndex DataFrames
+    alpha_list: list[float],
+    assets: str | list[str] = None,
+) -> pd.DataFrame:
+    """
+    Compute VaR breach rates (%) for each method and alpha level.
+
+    Args:
+        realized: DataFrame of realized returns
+        var_dict: Dict mapping method names to VaR DataFrames
+        alpha_list: List of confidence levels
+        assets: Assets to analyze. If None, uses all assets.
+
+    Returns:
+        DataFrame with MultiIndex (method, alpha) and columns as assets
+    """
+    if isinstance(realized, pd.Series):
+        realized = realized.to_frame()
+
+    if assets is None:
+        assets = realized.columns.tolist()
+    elif isinstance(assets, str):
+        assets = [assets]
+
+    results = []
+
+    for method, var_data in var_dict.items():
+        for alpha in alpha_list:
+            breach_rates = {}
+
+            for asset in assets:
+                # Handle different MultiIndex structures
+                if "theta_type" in var_data.columns.names:
+                    # GEV/GPD: extract 'with_theta'
+                    var_series = var_data.loc[:, (alpha, asset, "with_theta")]
+                elif "case" in var_data.columns.names:
+                    # EVT-GARCH: extract 'case4'
+                    var_series = var_data.loc[:, (alpha, asset, "case4")]
+                else:
+                    # Normal/Student-t
+                    var_series = var_data.loc[:, (alpha, asset)]
+
+                # Breach: realized return < -VaR (loss exceeds VaR)
+                breaches = (realized[asset] < -var_series).sum()
+                breach_rate = 100 * breaches / len(realized)
+                breach_rates[asset] = breach_rate
+
+            results.append({"method": method, "alpha": alpha, **breach_rates})
+
+    df = pd.DataFrame(results)
+    df = df.set_index(["method", "alpha"])
+    return df
+
+
+# ———————————————————————————————————————————————————————————————————————————————————————————————————————————————————————— #
+
+
+def plot_var_breach_histogram(
+    breach_rates: pd.DataFrame,  # MultiIndex (method, alpha), columns = assets
+    alpha_list: list[float],
+    assets: str | list[str] = None,
+) -> None:
+    """
+    Create grouped bar chart comparing VaR breach rates across methods.
+
+    Args:
+        breach_rates: DataFrame from compute_var_breaches()
+        alpha_list: List of confidence levels (for reference lines)
+        assets: Single asset or list. If None, plots all assets.
+    """
+    if assets is None:
+        assets = breach_rates.columns.tolist()
+    elif isinstance(assets, str):
+        assets = [assets]
+
+    methods = breach_rates.index.get_level_values("method").unique().tolist()
+    alphas = breach_rates.index.get_level_values("alpha").unique().tolist()
+
+    n = len(assets)
+    n_methods = len(methods)
+    n_alphas = len(alphas)
+
+    # Subplot layout
+    ncols = 2 if n > 1 else 1
+    nrows = int(np.ceil(n / ncols))
+    fig, axes = plt.subplots(nrows, ncols, figsize=(14, 4 * nrows))
+    axes = np.atleast_1d(axes).flatten()
+
+    x = np.arange(n_methods)
+    width = 0.6 / n_alphas
+
+    colours = ["#4899F0", "#F08C48", "#48F0A2", "#F048A2", "#A248F0"]
+    hatch_patterns = ["", "///", "\\\\\\", "|||", "---"]
+
+    for i, asset in enumerate(assets):
+        ax = axes[i]
+
+        # Plot bars for each alpha
+        for j, alpha in enumerate(alphas):
+            breach_values = []
+            for method in methods:
+                value = breach_rates.loc[(method, alpha), asset]
+                breach_values.append(value)
+
+            offset = (j - n_alphas / 2 + 0.5) * width
+            bars = ax.bar(
+                x + offset,
+                breach_values,
+                width,
+                label=f"α = {alpha:.2f}" if i == 0 else "",
+                color=colours[j],
+                edgecolor="black",
+                linewidth=0.5,
+            )
+
+            for bar in bars:
+                bar.set_hatch(hatch_patterns[j % len(hatch_patterns)])
+
+        # Reference lines
+        for j, alpha in enumerate(alphas):
+            expected_rate = alpha * 100
+            ax.axhline(
+                expected_rate,
+                color=colours[j],
+                linestyle="--",
+                linewidth=1,
+                alpha=0.8,
+                zorder=1,
+            )
+
+        ax.set_title(f"{asset}", fontsize=12, fontweight="bold")
+        ax.set_xticks(x)
+        ax.set_xticklabels(methods, fontsize=9, rotation=15, ha="right")
+        ax.set_ylabel("Breaches (%)", fontsize=10)
+        ax.set_xlabel("Model" if i >= (nrows - 1) * ncols else "", fontsize=10)
+        ax.grid(True, axis="y", alpha=0.3, linestyle=":")
+        ax.set_axisbelow(True)
+
+        if i == 0:
+            ax.legend(fontsize=8, loc="upper right")
+
+    # Remove unused subplots
+    for j in range(i + 1, len(axes)):
+        fig.delaxes(axes[j])
+
+    plt.tight_layout()
+    plt.show()
+
+
+# ———————————————————————————————————————————————————————————————————————————————————————————————————————————————————————— #
+
+
+def compute_breach_magnitudes(
+    realized: pd.DataFrame,
+    var_dict: dict,
+    alpha_list: list[float],
+    assets: str | list[str] = None,
+) -> pd.DataFrame:
+    """
+    Compute breach magnitude statistics: mean, std, and max of (VaR - realized)
+    when realized < -VaR (i.e., losses exceed VaR).
+
+    Returns:
+        DataFrame with MultiIndex (method, alpha, stat) and columns as assets
+    """
+    if isinstance(realized, pd.Series):
+        realized = realized.to_frame()
+
+    if assets is None:
+        assets = realized.columns.tolist()
+    elif isinstance(assets, str):
+        assets = [assets]
+
+    results = []
+
+    for method, var_data in var_dict.items():
+        for alpha in alpha_list:
+            stats = {}
+
+            for asset in assets:
+                # Extract VaR series
+                if "theta_type" in var_data.columns.names:
+                    var_series = var_data.loc[:, (alpha, asset, "with_theta")]
+                elif "case" in var_data.columns.names:
+                    var_series = var_data.loc[:, (alpha, asset, "case4")]
+                else:
+                    var_series = var_data.loc[:, (alpha, asset)]
+
+                # Breach magnitude: |realized - (-VaR)| when realized < -VaR
+                breach_mask = realized[asset] < -var_series
+
+                if breach_mask.sum() > 0:
+                    # Difference: how much the loss exceeded VaR
+                    breach_diff = (
+                        -var_series[breach_mask] - realized[asset][breach_mask]
+                    ).abs()
+
+                    mean_breach = breach_diff.mean()
+                    std_breach = breach_diff.std()
+                    max_breach = breach_diff.max()
+                else:
+                    mean_breach = 0.0
+                    std_breach = 0.0
+                    max_breach = 0.0
+
+                if asset not in stats:
+                    stats[asset] = {}
+
+                stats[asset]["mean"] = mean_breach
+                stats[asset]["std"] = std_breach
+                stats[asset]["max"] = max_breach
+
+            # Add rows for mean, std, max
+            for stat in ["mean", "std", "max"]:
+                row = {"method": method, "alpha": alpha, "stat": stat}
+                for asset in assets:
+                    row[asset] = stats[asset][stat]
+                results.append(row)
+
+    df = pd.DataFrame(results)
+    df = df.set_index(["method", "alpha", "stat"])
+    return df
+
+
+# ———————————————————————————————————————————————————————————————————————————————————————————————————————————————————————— #
+
+
+def plot_breach_magnitude_candles(
+    breach_magnitudes: pd.DataFrame,
+    alpha_list: list[float],
+    assets: str | list[str] = None,
+) -> None:
+    """
+    Create candlestick plot showing breach magnitude distribution.
+
+    Candle components:
+    - Center line: mean breach magnitude
+    - Box: ±1 std from mean
+    - Whisker: extends to max breach
+
+    Args:
+        breach_magnitudes: DataFrame from compute_breach_magnitudes()
+        alpha_list: List of confidence levels
+        assets: Single asset or list. If None, plots all assets.
+    """
+    if assets is None:
+        assets = breach_magnitudes.columns.tolist()
+    elif isinstance(assets, str):
+        assets = [assets]
+
+    methods = breach_magnitudes.index.get_level_values("method").unique().tolist()
+    alphas = breach_magnitudes.index.get_level_values("alpha").unique().tolist()
+
+    n = len(assets)
+    n_methods = len(methods)
+    n_alphas = len(alphas)
+
+    # Subplot layout
+    ncols = 2 if n > 1 else 1
+    nrows = int(np.ceil(n / ncols))
+    fig, axes = plt.subplots(nrows, ncols, figsize=(14, 4 * nrows))
+    axes = np.atleast_1d(axes).flatten()
+
+    x = np.arange(n_methods)
+    width = 0.7 / n_alphas
+
+    colors_box = ["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd"]
+    colors_line = ["#185c8d", "#b85c0b", "#195c19", "#651212", "#46315b"]
+
+    for i, asset in enumerate(assets):
+        ax = axes[i]
+
+        for j, alpha in enumerate(alphas):
+            means = []
+            stds = []
+            maxs = []
+
+            for method in methods:
+                mean_val = breach_magnitudes.loc[(method, alpha, "mean"), asset]
+                std_val = breach_magnitudes.loc[(method, alpha, "std"), asset]
+                max_val = breach_magnitudes.loc[(method, alpha, "max"), asset]
+
+                means.append(mean_val)
+                stds.append(std_val)
+                maxs.append(max_val)
+
+            means = np.array(means)
+            stds = np.array(stds)
+            maxs = np.array(maxs)
+
+            offset = (j - n_alphas / 2 + 0.5) * width
+            positions = x + offset
+
+            # Draw candlesticks
+            for k, pos in enumerate(positions):
+                mean = means[k]
+                std = stds[k]
+                max_val = maxs[k]
+
+                box_bottom = max(0, mean - std)
+                box_top = mean + std
+                box_height = box_top - box_bottom
+
+                rect = plt.Rectangle(
+                    (pos - width / 2, box_bottom),
+                    width,
+                    box_height,
+                    facecolor=colors_box[j],
+                    edgecolor="black",
+                    linewidth=1.2,
+                    alpha=0.7,
+                )
+                ax.add_patch(rect)
+
+                ax.hlines(
+                    mean,
+                    pos - width / 2,
+                    pos + width / 2,
+                    colors="black",
+                    linewidth=2,
+                    zorder=10,
+                )
+
+                ax.vlines(
+                    pos,
+                    box_top,
+                    max_val,
+                    colors=colors_line[j],
+                    linewidth=1.5,
+                    alpha=0.8,
+                )
+
+                ax.hlines(
+                    max_val,
+                    pos - width / 3,
+                    pos + width / 3,
+                    colors=colors_line[j],
+                    linewidth=1.5,
+                    alpha=0.8,
+                )
+
+            if i == 0:
+                ax.plot(
+                    [],
+                    [],
+                    "s",
+                    color=colors_box[j],
+                    markersize=8,
+                    label=f"α = {alpha:.2f}",
+                    markeredgecolor="black",
+                )
+
+        ax.axhline(0, color="gray", linestyle=":", linewidth=1, alpha=0.5)
+        ax.set_title(f"{asset}", fontsize=12, fontweight="bold")
+        ax.set_xticks(x)
+        ax.set_xticklabels(methods, fontsize=9, rotation=15, ha="right")
+        ax.set_ylabel("Breach Magnitude", fontsize=10)
+        ax.grid(True, axis="y", alpha=0.3, linestyle=":")
+        ax.set_axisbelow(True)
+
+        if i == 0:
+            ax.legend(fontsize=8, loc="upper right")
+
+    # Remove unused subplots
     for j in range(i + 1, len(axes)):
         fig.delaxes(axes[j])
 
