@@ -74,8 +74,6 @@ def visual_descriptive_statistics(
 
     rolling_window = 252  # 1 year for daily data
     assets = returns_df.columns
-    if save:
-        os.makedirs("images/2", exist_ok=True)
 
     # ————————————————————————————————————————————
     # Correlation matrix heatmap
@@ -124,7 +122,7 @@ def visual_descriptive_statistics(
         ax_qq.set_title(f"{col} — QQ-Plot", fontsize=10)
     plt.tight_layout()
     if save:
-        plt.savefig("images/2/histogram_qqplots.png", dpi=300)
+        plt.savefig("images/histogram_qqplots.png", dpi=300)
     if plot:
         plt.show()
 
@@ -145,7 +143,7 @@ def visual_descriptive_statistics(
 
     plt.tight_layout()
     if save:
-        plt.savefig("images/2/acf_r_r2.png", dpi=300)
+        plt.savefig("images/acf_r_r2.png", dpi=300)
     if plot:
         plt.show()
 
@@ -166,7 +164,7 @@ def visual_descriptive_statistics(
 
     plt.tight_layout()
     if save:
-        plt.savefig("images/2/pacf_r_r2.png", dpi=300)
+        plt.savefig("images/pacf_r_r2.png", dpi=300)
     if plot:
         plt.show()
 
@@ -204,7 +202,7 @@ def visual_descriptive_statistics(
         ax.tick_params(axis="x", rotation=45)
     plt.tight_layout()
     if save:
-        plt.savefig("images/2/rolling_moments.png", dpi=300)
+        plt.savefig("images/rolling_moments.png", dpi=300)
     if plot:
         plt.show()
 
@@ -232,7 +230,7 @@ def visual_descriptive_statistics(
     plt.xlabel("Date")
     plt.tick_params(axis="x", rotation=45)
     if save:
-        plt.savefig("images/2/highest_rolling_correlation.png", dpi=300)
+        plt.savefig("images/highest_rolling_correlation.png", dpi=300)
     if plot:
         plt.show()
 
@@ -330,7 +328,7 @@ def univariate_garch_diagnostics(
 
     plt.tight_layout()
     if save:
-        plt.savefig("images/2/garch_model_comparison.png", dpi=300)
+        plt.savefig("images/garch_model_comparison.png", dpi=300)
     if plot:
         plt.show()
 
@@ -401,7 +399,7 @@ def ewp_garch_diagnostics(
     plt.legend()
     plt.tight_layout()
     if save:
-        plt.savefig("images/2/ewp_garch_model_comparison.png", dpi=300)
+        plt.savefig("images/ewp_garch_model_comparison.png", dpi=300)
     if plot:
         plt.show()
 
