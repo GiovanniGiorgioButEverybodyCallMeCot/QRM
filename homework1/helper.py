@@ -1510,7 +1510,11 @@ def compute_breach_magnitudes(
     """
     Compute breach magnitude statistics: mean, std, and max of (VaR - realized)
     when realized < -VaR (i.e., losses exceed VaR).
-
+    Args:
+        realized: DataFrame of realized returns
+        var_dict: Dict mapping method names to VaR DataFrames
+        alpha_list: List of confidence levels
+        assets: Assets to analyze. If None, uses all assets.
     Returns:
         DataFrame with MultiIndex (method, alpha, stat) and columns as assets
     """
