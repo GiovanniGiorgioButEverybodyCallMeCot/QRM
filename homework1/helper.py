@@ -2,7 +2,7 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
-import os
+import math
 import seaborn as sns
 from scipy import stats
 from statsmodels.stats.diagnostic import acorr_ljungbox
@@ -10,7 +10,7 @@ from statsmodels.graphics.tsaplots import plot_acf, plot_pacf
 from arch import arch_model
 from scipy.stats import t, kstest, norm, genextreme
 from typing import Tuple, Dict
-from scipy.stats import genpareto
+from scipy.stats import genpareto, laplace, cauchy
 
 # ——————————————————————————————————————————————————————————————————————————————————————————————————————————————————————— #
 
@@ -258,10 +258,11 @@ def visual_descriptive_statistics(
             "n_extreme_3std": returns_df.apply(
                 lambda x: (np.abs(x) > 3 * x.std()).sum()
             ),
+            "ttest_mean_p": returns_df.apply(lambda x: stats.ttest_1samp(x, 0).pvalue),
         }
     ).round(
         4
-    )  # more readable
+    )  # più leggibile
 
     return descriptive_stat_df
 
@@ -348,7 +349,57 @@ def univariate_garch_diagnostics(
         bic_values = [results[asset][model_name].bic for asset in training_set.columns]
         avg_metrics[model_name] = [np.mean(aic_values), np.mean(bic_values)]
 
-    return avg_metrics
+    return avg_metrics, results
+
+
+def garch_parameter_significance(
+    results: dict, training_set: pd.DataFrame, alpha_signif: float = 0.05
+) -> pd.DataFrame:
+    """
+    Calcola la proporzione di parametri significativi per ciascun modello GARCH
+    sui dati forniti.
+
+    Args:
+        results: Dizionario con risultati dei modelli GARCH per ciascun asset.
+                 Deve avere la struttura results[asset][model].
+        training_set: DataFrame con i dati dei ritorni degli asset.
+        alpha_signif: Soglia di significatività per i p-value (default 0.05).
+
+    Returns:
+        DataFrame con proporzione di parametri significativi per modello e parametro.
+    """
+
+    # Raccogli tutti i parametri possibili
+    all_params = set()
+    for asset in training_set.columns:
+        for model in UNIVARIATE_GARCH_MODELS:
+            all_params.update(results[asset][model].params.index)
+    all_params = sorted(list(all_params))
+
+    # Creazione tabella vuota
+    significance_table = pd.DataFrame(
+        index=UNIVARIATE_GARCH_MODELS, columns=all_params, dtype=float
+    )
+
+    # Calcolo proporzione di parametri significativi
+    for model_name in UNIVARIATE_GARCH_MODELS:
+        model_param_counts = {p: [] for p in all_params}
+        for asset in training_set.columns:
+            res = results[asset][model_name]
+            pvalues = res.pvalues
+            for param in all_params:
+                if param in pvalues:
+                    model_param_counts[param].append(pvalues[param] < alpha_signif)
+                else:
+                    model_param_counts[param].append(np.nan)
+        # Proporzione di parametri significativi (ignorando NaN)
+        for param in all_params:
+            vals = pd.Series(model_param_counts[param]).dropna()
+            significance_table.loc[model_name, param] = (
+                vals.mean() if len(vals) > 0 else np.nan
+            )
+
+    return significance_table
 
 
 # ———————————————————————————————————————————————————————————————————————————————————————————————————————————————————————— #
@@ -412,11 +463,16 @@ def ewp_garch_diagnostics(
 
     if print_summaries:
         for garch_model in UNIVARIATE_GARCH_MODELS:
-            print(results[garch_model].summary)
-    return {
-        garch_model: [results[garch_model].aic, results[garch_model].bic]
-        for garch_model in UNIVARIATE_GARCH_MODELS
-    }  # levereging dictionary comprehension because it looks nice
+            print(results[garch_model].summary())
+
+    # AIC / BIC
+    aic_bic = {
+        model: [results[model].aic, results[model].bic]
+        for model in UNIVARIATE_GARCH_MODELS
+    }
+
+    # RETURN BOTH
+    return aic_bic, results
 
 
 # ———————————————————————————————————————————————————————————————————————————————————————————————————————————————————————— #
@@ -424,6 +480,15 @@ def ewp_garch_diagnostics(
 
 
 def _make_model(y: pd.Series, model_name: str = "EGARCH", dist: str = "normal"):
+    """
+    Helper function to create an arch_model instance based on model_name and dist.
+    Args:
+        y: Series of returns to model.
+        model_name: GARCH-type model name.
+        dist: Distribution for innovations.
+    Returns:
+        arch_model instance.
+    """
     dist = dist.lower()
     if model_name.upper() == "GARCH":
         return arch_model(y, mean="Constant", vol="GARCH", p=1, q=1, dist=dist)
@@ -449,6 +514,14 @@ def rolling_forecast_sigma(
     """
     For each date in test_series, fit the model on past data up to t-1 and forecast t.
     Returns two Series indexed by test_series.index: mu_hat and var_hat.
+    Args:
+        train_series: Series of training returns.
+        test_series: Series of test returns.
+        model_name: GARCH-type model name.
+        dist: Distribution for innovations.
+        window: Rolling window size (None for expanding window).
+    Returns:
+        Tuple of two Series: mu_hat and var_hat.
     """
     # Build a continuous series to slice by position safely
     full = pd.concat([train_series, test_series]).dropna()
@@ -680,49 +753,42 @@ def plot_VaR_estimates(
 # Standardized Residual Diagnostics Plotting
 def plot_std_resid_diagnostics(Z=None, show: bool = True, save: bool = False) -> None:
     """
-    Plot histogram+PDF fits (Normal, t, GEV) and QQ plots (3 panels) for standardized residuals Z.
+    Plot histogram+PDF fits (Normal, Student-t, Laplace, Cauchy)
+    and QQ plots for standardized residuals Z (heavy-tail distributions).
+
     Args:
-        Z: Series of standardized residuals.
+        Z: Series or array of standardized residuals.
         show: Whether to display the plots.
         save: Whether to save the plots as PNG files.
-    Returns:
-        None
     """
-
-    # --- fit distributions ---
+    # --- Fit distributions ---
     mu_hat = Z.mean()
     sig_hat = Z.std(ddof=0)
     df_hat, loc_t, scale_t = t.fit(Z, floc=0)
-    c_hat, loc_gev, scale_gev = genextreme.fit(Z)
+    loc_lap, scale_lap = laplace.fit(Z)
+    loc_cau, scale_cau = cauchy.fit(Z)
 
-    params = {
-        "normal": {"mu": mu_hat, "sigma": sig_hat},
-        "t": {"df": df_hat, "loc": loc_t, "scale": scale_t},
-        "gev": {"c": c_hat, "loc": loc_gev, "scale": scale_gev},
-    }
-
-    # --- create figure layout ---
-    fig = plt.figure(figsize=(10, 8))
-    gs = fig.add_gridspec(2, 3, height_ratios=[1.2, 1])
+    # --- Figure layout ---
+    fig = plt.figure(figsize=(14, 9))
+    gs = fig.add_gridspec(2, 2, height_ratios=[1.2, 1])
     ax_top = fig.add_subplot(gs[0, :])
     ax1 = fig.add_subplot(gs[1, 0])
     ax2 = fig.add_subplot(gs[1, 1])
-    ax3 = fig.add_subplot(gs[1, 2])
+    # Se vuoi più panel, puoi aggiungerne altri
 
-    # --- histogram + PDFs ---
+    # --- Histogram + PDFs ---
     xs = np.linspace(Z.min(), Z.max(), 400)
     ax_top.hist(Z, bins=120, density=True, alpha=0.5, label="Z histogram")
-    ax_top.plot(xs, norm.pdf(xs, mu_hat, sig_hat), label="Normal fit")
-    ax_top.plot(xs, t.pdf(xs, df_hat, loc_t, scale_t), label=f"t fit (df={df_hat:.1f})")
+    ax_top.plot(xs, norm.pdf(xs, mu_hat, sig_hat), label="Normal")
     ax_top.plot(
-        xs,
-        genextreme.pdf(xs, c_hat, loc_gev, scale_gev),
-        label=f"GEV fit (c={c_hat:.2f})",
+        xs, t.pdf(xs, df_hat, loc_t, scale_t), label=f"Student-t (df={df_hat:.1f})"
     )
+    ax_top.plot(xs, laplace.pdf(xs, loc_lap, scale_lap), label="Laplace")
+    ax_top.plot(xs, cauchy.pdf(xs, loc_cau, scale_cau), label="Cauchy")
     ax_top.set_title("Standardized residuals — histogram with fitted distributions")
     ax_top.legend()
 
-    # --- local QQ helper ---
+    # --- Local QQ helper ---
     def qqplot(ax, sample, q_theor, title):
         s = np.sort(sample)
         q = np.sort(q_theor)
@@ -737,19 +803,19 @@ def plot_std_resid_diagnostics(Z=None, show: bool = True, save: bool = False) ->
     p = (np.arange(1, n + 1) - 0.5) / n
     q_norm = norm.ppf(p, mu_hat, sig_hat)
     q_t = t.ppf(p, df_hat, loc_t, scale_t)
-    q_gev = genextreme.ppf(p, c_hat, loc_gev, scale_gev)
+    q_lap = laplace.ppf(p, loc_lap, scale_lap)
+    q_cau = cauchy.ppf(p, loc_cau, scale_cau)
 
     # --- QQ plots ---
     qqplot(ax1, Z, q_norm, "QQ vs Normal")
     qqplot(ax2, Z, q_t, "QQ vs Student-t")
-    qqplot(ax3, Z, q_gev, "QQ vs GEV")
-    plt.tight_layout()
+    # opzionale: aggiungere altri panel per Laplace e Cauchy
 
+    plt.tight_layout()
     if show:
         plt.show()
-
     if save:
-        plt.savefig("image/5/std_resid_diagnostics.png", dpi=300)
+        plt.savefig("images/std_resid_diagnostics.png", dpi=300)
 
 
 # ———————————————————————————————————————————————————————————————————————————————————————————————————————————————————————— #
@@ -1190,6 +1256,9 @@ def fit_evt_params_insample(
     }
 
 
+# ———————————————————————————————————————————————————————————————————————————————————————————————————————————————————————— #
+
+
 def compute_evt_garch_var(
     mu: pd.Series,
     sigma2: pd.Series,
@@ -1376,24 +1445,65 @@ def compute_var_breaches(
     results = []
 
     for method, var_data in var_dict.items():
+        # how many levels in the VaR columns?
+        nlevels = getattr(getattr(var_data, "columns", None), "nlevels", 1)
+
         for alpha in alpha_list:
             breach_rates = {}
 
             for asset in assets:
-                # Handle different MultiIndex structures
-                if "theta_type" in var_data.columns.names:
-                    # GEV/GPD: extract 'with_theta'
-                    var_series = var_data.loc[:, (alpha, asset, "with_theta")]
-                elif "case" in var_data.columns.names:
-                    # EVT-GARCH: extract 'case4'
-                    var_series = var_data.loc[:, (alpha, asset, "case4")]
+
+                # --- 1. Select the appropriate VaR series for this method/asset/alpha ---
+                if nlevels == 3:
+                    # MultiIndex: (alpha, asset, something)
+                    level2_vals = list(var_data.columns.levels[2])
+
+                    # Choose the "main" label in the 3rd level depending on method
+                    if method in ("GEV", "GPD"):
+                        # Prefer dependence-corrected version
+                        if "with_theta" in level2_vals:
+                            chosen = "with_theta"
+                        elif "GEV_theta" in level2_vals:
+                            chosen = "GEV_theta"
+                        else:
+                            chosen = level2_vals[-1]  # fallback
+
+                    elif method in ("EVT", "EVT-GARCH"):
+                        # EVT-GARCH VaR: prefer the dependence-corrected case
+                        if "case4" in level2_vals:
+                            chosen = "case4"
+                        elif "GEV_theta" in level2_vals:
+                            chosen = "GEV_theta"
+                        elif "with_theta" in level2_vals:
+                            chosen = "with_theta"
+                        elif "GEV_ind" in level2_vals and "GEV_theta" in level2_vals:
+                            chosen = "GEV_theta"
+                        elif "GEV_theta" in level2_vals:
+                            chosen = "GEV_theta"
+                        else:
+                            chosen = level2_vals[-1]  # fallback
+                    else:
+                        # Any other 3-level structure: just take the last label
+                        chosen = level2_vals[-1]
+
+                    var_series = var_data.loc[:, (alpha, asset, chosen)]
+
                 else:
-                    # Normal/Student-t
+                    # 2-level case: (alpha, asset) → Normal / t etc.
                     var_series = var_data.loc[:, (alpha, asset)]
 
-                # Breach: realized return < -VaR (loss exceeds VaR)
-                breaches = (realized[asset] < -var_series).sum()
-                breach_rate = 100 * breaches / len(realized)
+                # If, for any reason, we still got a DataFrame, take the first column
+                if isinstance(var_series, pd.DataFrame):
+                    var_series = var_series.iloc[:, 0]
+
+                # --- 2. Align indices before comparison (very important) ---
+                r_asset, v_asset = realized[asset].align(var_series, join="inner")
+
+                # --- 3. Compute breach rate: realized return < -VaR (loss exceeds VaR) ---
+                breaches = (r_asset < -v_asset).sum()
+                breach_rate = (
+                    100.0 * breaches / len(r_asset) if len(r_asset) > 0 else np.nan
+                )
                 breach_rates[asset] = breach_rate
 
             results.append({"method": method, "alpha": alpha, **breach_rates})
@@ -1513,6 +1623,8 @@ def compute_breach_magnitudes(
     Args:
         realized: DataFrame of realized returns
         var_dict: Dict mapping method names to VaR DataFrames
+        alpha_list: List of confidence levels
+        assets: Assets to analyze. If None, uses all assets.
     Returns:
         DataFrame with MultiIndex (method, alpha, stat) and columns as assets
     """
@@ -1720,3 +1832,588 @@ def plot_breach_magnitude_candles(
 
     plt.tight_layout()
     plt.show()
+
+
+# ———————————————————————————————————————————————————————————————————————————————————————————————————————————————————————— #
+def compute_all_ES(
+    mu_all,
+    sigma2_all,
+    df_params,
+    gev_fits,
+    gpd_fits,
+    VaR_gev,
+    VaR_gpd,
+    alpha_list,
+    assets_list,
+    test_dates,
+):
+    """
+    Compute Expected Shortfall (ES) for all assets and methods.
+    Args:
+        mu_all: DataFrame of conditional mean forecasts for all assets.
+        sigma2_all: DataFrame of conditional variance forecasts for all assets.
+        df_params: Dict mapping asset names to degrees of freedom for Student-t.
+        gev_fits: Dict mapping asset names to GEV fit parameters.
+        gpd_fits: Dict mapping asset names to GPD fit parameters.
+        VaR_gev: DataFrame with MultiIndex columns (alpha, asset, theta_type) of GEV VaR estimates.
+        VaR_gpd: DataFrame with MultiIndex columns (alpha, asset, method) of GPD VaR estimates.
+        alpha_list: List of confidence levels.
+        assets_list: List of asset names.
+        test_dates: DatetimeIndex for the test period.
+    Returns:
+        DataFrame with MultiIndex columns (alpha, asset, method) of ES estimates."""
+
+    all_assets = list(assets_list) + ["EWP"]
+    sigma_all = np.sqrt(sigma2_all)
+
+    ES = pd.DataFrame(
+        index=test_dates,
+        columns=pd.MultiIndex.from_product(
+            [alpha_list, all_assets, ["Normal", "Student-t", "GEV_theta", "GPD_ind"]],
+            names=["alpha", "asset", "method"],
+        ),
+        dtype=float,
+    )
+
+    # =============================
+    # NORMAL ES
+    # =============================
+    for alpha in alpha_list:
+        z = -norm.pdf(norm.ppf(alpha)) / alpha
+        for asset in all_assets:
+            ES.loc[:, (alpha, asset, "Normal")] = (
+                mu_all[asset] - sigma_all[asset] * z  # ES is negative
+            )
+
+    # =============================
+    # STUDENT-T ES
+    # =============================
+    for alpha in alpha_list:
+        for asset in all_assets:
+            nu = df_params[asset]
+            t_alpha = t.ppf(alpha, nu)
+            scale_term = (nu + t_alpha**2) / (nu - 1)
+            t_pdf = t.pdf(t_alpha, nu)
+            ES_t_std = -t_pdf * scale_term / alpha
+            ES.loc[:, (alpha, asset, "Student-t")] = (
+                mu_all[asset] - sigma_all[asset] * ES_t_std
+            )
+
+    # =============================
+    # GEV–THETA ES
+    # =============================
+    for alpha in alpha_list:
+        for asset in all_assets:
+            try:
+                VaR_theta = VaR_gev.loc[:, (alpha, asset, "with_theta")]
+                xi = gev_fits[asset]["gev_shape"]
+                beta = gev_fits[asset]["gev_scale"]
+
+                if abs(xi) > 1e-6:
+                    ES_gev = VaR_theta + (
+                        beta - xi * (VaR_theta - gev_fits[asset]["gev_loc"])
+                    ) / (1 - xi)
+                else:
+                    ES_gev = VaR_theta - beta * np.log(alpha)
+
+                ES.loc[:, (alpha, asset, "GEV_theta")] = ES_gev
+            except:
+                ES.loc[:, (alpha, asset, "GEV_theta")] = np.nan
+
+    # =============================
+    # GPD–IND ES
+    # =============================
+    for alpha in alpha_list:
+        for asset in all_assets:
+
+            # Seleziona VaR GPD
+            VaR_g = VaR_gpd.loc[:, (alpha, asset, "independent")]
+
+            # Parametri GPD
+            xi = gpd_fits[asset]["gpd_xi"]
+            beta = gpd_fits[asset]["gpd_beta"]
+            threshold = gpd_fits[asset]["threshold"]
+
+            # Se xi non è definito, metti NaN
+            if np.isnan(xi):
+                ES.loc[:, (alpha, asset, "GPD_ind")] = np.nan
+                continue
+
+            # Calcolo ES (solo se xi < 1)
+            if xi < 1:
+                ES_gpd = (VaR_g + beta - xi * (VaR_g - threshold)) / (1 - xi)
+            else:
+                ES_gpd = np.nan
+
+            # Salva nell'ES DataFrame
+            ES.loc[:, (alpha, asset, "GPD_ind")] = ES_gpd
+
+    return ES
+
+
+# ———————————————————————————————————————————————————————————————————————————————————————————————————————————————————————— #
+
+
+def plot_mef_and_thresholds(
+    returns_dict: dict,
+    start_percentile: float = 0.8,
+    step: float = 0.01,
+    verbose: bool = False,
+) -> dict:
+    """
+    Plot Mean Excess Function (MEF) for each asset and display thresholds for each percentile.
+
+    Args:
+        returns_dict: dict of asset_name -> pd.Series of returns
+        start_percentile: percentile to start the MEF and threshold table (default 0.8 = 80%)
+        step: step size between percentiles (default 0.01 = 1%)
+
+    Returns:
+        thresholds_grid: dict of asset -> Series of thresholds for each percentile
+    """
+    quantile_grid = np.arange(start_percentile, 1.0, step)
+    thresholds_grid = {}
+
+    n = len(returns_dict)
+    ncols = 2 if n > 1 else 1
+    nrows = (n + ncols - 1) // ncols  # Ceiling division
+
+    fig, axes = plt.subplots(nrows, ncols, figsize=(8 * ncols, 4 * nrows))
+
+    # Flatten axes array for easier indexing
+    if n == 1:
+        axes = [axes]
+    else:
+        axes = axes.flatten()
+
+    for idx, (asset, r) in enumerate(returns_dict.items()):
+        r = r.dropna()
+        # Thresholds per quantile
+        thresholds = r.quantile(quantile_grid)
+        thresholds_grid[asset] = thresholds
+
+        # Calcolo Mean Excess Function
+        excess_means = [
+            r[r > u].sub(u).mean() if np.any(r > u) else 0 for u in thresholds
+        ]
+
+        # Plot MEF on subplot
+        ax = axes[idx]
+        ax.plot(thresholds, excess_means, marker="o")
+        ax.set_xlabel("Threshold u")
+        ax.set_ylabel("Mean Excess (E[X-u | X>u])")
+        ax.set_title(f"Mean Excess Function — {asset}")
+        ax.grid(True)
+
+        if verbose:
+            # Stampa tabella threshold per percentile
+            print(f"\nAsset: {asset}")
+            for q, val in zip(quantile_grid, thresholds):
+                print(f"  Quantile {q:.3f} → Threshold {val:.4f}")
+
+    # Hide any unused subplots
+    for idx in range(n, len(axes)):
+        axes[idx].set_visible(False)
+
+    plt.tight_layout()
+    plt.show()
+
+    return thresholds_grid
+
+
+# ———————————————————————————————————————————————————————————————————————————————————————————————————————————————————————— #
+def explore_gpd_thresholds(
+    all_assets,
+    all_returns,
+    start_percentile=0.8,
+    step=0.005,
+    max_threshold=0.99,
+    verbose: bool = False,
+) -> dict:
+    """
+    Explore different thresholds for GPD fit and print xi for each asset and threshold.
+
+    Args:
+        all_assets: list of asset names
+        all_returns: dict of asset_name -> returns series
+        start_percentile: starting quantile for threshold (default 0.8)
+        step: increment in quantile for threshold
+        max_threshold: maximum quantile to try (default 0.99)
+    """
+    import numpy as np
+    from scipy.stats import genpareto
+
+    thresholds = np.arange(start_percentile, max_threshold + step, step)
+
+    results = {asset: {} for asset in all_assets}
+
+    for asset in all_assets:
+        r = all_returns[asset].dropna()
+        print(f"\nAsset: {asset}")
+        for q in thresholds:
+            u = np.quantile(r, q)
+            exceed = r[r > u]
+            excess = exceed - u
+
+            if len(exceed) < 1:
+                xi_hat = np.nan
+            else:
+                xi_hat, loc_hat, beta_hat = genpareto.fit(excess.values, floc=0.0)
+            results[asset][q] = xi_hat
+            print(f"  Threshold quantile {q:.4f} (u={u:.4f}): xi = {xi_hat:.4f}")
+
+    return results
+
+
+# ———————————————————————————————————————————————————————————————————————————————————————————————————————————————————————— #
+
+
+def compute_all_ES(
+    mu_all,
+    sigma2_all,
+    df_params,
+    gev_fits,
+    gpd_fits,
+    VaR_gev,
+    VaR_gpd,
+    alpha_list,
+    assets_list,
+    test_dates,
+):
+
+    all_assets = list(assets_list) + ["EWP"]
+    sigma_all = np.sqrt(sigma2_all)
+
+    ES = pd.DataFrame(
+        index=test_dates,
+        columns=pd.MultiIndex.from_product(
+            [alpha_list, all_assets, ["Normal", "Student-t", "GEV_theta", "GPD_ind"]],
+            names=["alpha", "asset", "method"],
+        ),
+        dtype=float,
+    )
+
+    # =============================
+    # NORMAL ES
+    # =============================
+    for alpha in alpha_list:
+        z = -norm.pdf(norm.ppf(alpha)) / alpha
+        for asset in all_assets:
+            ES.loc[:, (alpha, asset, "Normal")] = (
+                mu_all[asset] - sigma_all[asset] * z  # ES is negative
+            )
+
+    # =============================
+    # STUDENT-T ES
+    # =============================
+    for alpha in alpha_list:
+        for asset in all_assets:
+            nu = df_params[asset]
+            t_alpha = t.ppf(alpha, nu)
+            scale_term = (nu + t_alpha**2) / (nu - 1)
+            t_pdf = t.pdf(t_alpha, nu)
+            ES_t_std = -t_pdf * scale_term / alpha
+            ES.loc[:, (alpha, asset, "Student-t")] = (
+                mu_all[asset] - sigma_all[asset] * ES_t_std
+            )
+
+    # =============================
+    # GEV–THETA ES
+    # =============================
+    for alpha in alpha_list:
+        for asset in all_assets:
+            try:
+                VaR_theta = VaR_gev.loc[:, (alpha, asset, "with_theta")]
+                xi = gev_fits[asset]["gev_shape"]
+                beta = gev_fits[asset]["gev_scale"]
+
+                if abs(xi) > 1e-6:
+                    ES_gev = VaR_theta + (
+                        beta - xi * (VaR_theta - gev_fits[asset]["gev_loc"])
+                    ) / (1 - xi)
+                else:
+                    ES_gev = VaR_theta - beta * np.log(alpha)
+
+                ES.loc[:, (alpha, asset, "GEV_theta")] = ES_gev
+            except:
+                ES.loc[:, (alpha, asset, "GEV_theta")] = np.nan
+
+    # =============================
+    # GPD–IND ES
+    # =============================
+    for alpha in alpha_list:
+        for asset in all_assets:
+
+            # Seleziona VaR GPD
+            VaR_g = VaR_gpd.loc[:, (alpha, asset, "independent")]
+
+            # Parametri GPD
+            xi = gpd_fits[asset]["gpd_xi"]
+            beta = gpd_fits[asset]["gpd_beta"]
+            threshold = gpd_fits[asset]["threshold"]
+
+            # Se xi non è definito, metti NaN
+            if np.isnan(xi):
+                ES.loc[:, (alpha, asset, "GPD_ind")] = np.nan
+                continue
+
+            # Calcolo ES (solo se xi < 1)
+            if xi < 1:
+                ES_gpd = (VaR_g + beta - xi * (VaR_g - threshold)) / (1 - xi)
+            else:
+                ES_gpd = np.nan
+
+            # Salva nell'ES DataFrame
+            ES.loc[:, (alpha, asset, "GPD_ind")] = ES_gpd
+
+    return ES
+
+
+# ———————————————————————————————————————————————————————————————————————————————————————————————————————————————————————— #
+
+
+def plot_ES_VaR_returns(ES_all, VaR_final, test_all, assets, alphas=[0.01, 0.05]):
+    methods = ES_all.columns.get_level_values("method").unique()
+    palette = sns.color_palette("tab10", n_colors=len(methods))
+    color_dict = dict(zip(methods, palette))
+
+    # Calculate grid dimensions based on number of assets
+    n_assets = len(assets)
+    ncols = 2 if n_assets > 1 else 1
+    nrows = math.ceil(n_assets / ncols)
+
+    # Create one figure for each alpha
+    for alpha in alphas:
+        # Initialize subplot with dynamic height
+        fig, axes = plt.subplots(nrows, ncols, figsize=(16, 5 * nrows))
+
+        # Handle case where we have only one row
+        if nrows == 1 and ncols == 1:
+            axes = [axes]
+        elif nrows == 1 or ncols == 1:
+            axes = axes.flatten()
+        else:
+            axes = axes.flatten()
+
+        plot_idx = 0
+
+        for asset in assets:
+            ax = axes[plot_idx]
+
+            # Loop over methods
+            for method in methods:
+                # Inverted ES
+                try:
+                    es_col = -ES_all.loc[:, (alpha, asset, method)]
+                    ax.plot(
+                        es_col.index,
+                        es_col,
+                        linestyle="--",
+                        color=color_dict[method],
+                        label=f"ES ({method})",
+                    )
+
+                    # Inverted VaR
+                    var_col = -VaR_final.loc[:, (alpha, asset, method)]
+                    ax.plot(
+                        var_col.index,
+                        var_col,
+                        linestyle="-",
+                        color=color_dict[method],
+                        label=f"VaR ({method})",
+                    )
+                except KeyError:
+                    print(f"Warning: Missing data for {asset}, {alpha}, {method}")
+                    continue
+
+            # Realized returns
+            returns = test_all[asset]
+            ax.plot(
+                returns.index,
+                returns,
+                color="0.1",
+                alpha=0.7,
+                label="Realized returns",
+                linewidth=1,
+            )
+
+            # Formatting specific axis
+            ax.set_title(f"{asset}")
+            ax.set_xlabel("DATE")
+            ax.set_ylabel("Value")
+            ax.grid(True, alpha=0.3)
+            ax.legend(loc="upper right", fontsize="small", frameon=True)
+
+            plot_idx += 1
+
+        # Turn off any unused axes
+        for i in range(plot_idx, len(axes)):
+            axes[i].axis("off")
+
+        # Add overall title for the figure
+        fig.suptitle(
+            f"ES, VaR, and Realized Returns - Alpha = {alpha}", fontsize=16, y=1.00
+        )
+        plt.tight_layout()
+        plt.show()
+
+
+# ———————————————————————————————————————————————————————————————————————————————————————————————————————————————————————— #
+
+
+def gpd_var_manual_thresholds(
+    thresholds_manual: dict,
+    all_returns: dict,
+    test_dates: pd.DatetimeIndex,
+    alpha_list: list,
+    mu_all: pd.DataFrame,
+    sigma_all: pd.DataFrame,
+    test_all: pd.DataFrame,
+) -> tuple[dict, pd.DataFrame]:
+    """
+    Run GPD-based extreme value VaR analysis using manually specified thresholds
+    with dynamic VaR based on GARCH mu/sigma (ignores extremal index).
+
+    Args:
+        thresholds_manual: dict of asset_name -> threshold value
+        all_returns: dict of asset -> standardized residuals (for fitting)
+        test_dates: DatetimeIndex for test period
+        alpha_list: list of confidence levels
+        mu_all: GARCH mean forecasts (all assets including EWP)
+        sigma_all: GARCH sigma forecasts (all assets including EWP)
+        test_all: test returns DataFrame (all assets including EWP)
+
+    Returns:
+        Tuple of (gpd_fit_results_dict, VaR_DataFrame)
+    """
+    all_assets = list(all_returns.keys())
+
+    # 1) Fit GPD models
+    print("Fitting GPD models with manual thresholds...")
+    gpd_fits = {}
+
+    for asset in all_assets:
+        r = all_returns[asset]
+        u = thresholds_manual.get(asset, 0.0)
+        exceed = r[r > u]
+        excess = exceed - u
+
+        if len(exceed) < 1:
+            print(f"Warning: {asset} has no exceedances above threshold {u:.4f}")
+            xi_hat, beta_hat, p_u, n_exc = np.nan, np.nan, 0, 0
+        else:
+            xi_hat, _, beta_hat = genpareto.fit(excess.values, floc=0.0)
+            p_u = len(exceed) / len(r)
+            n_exc = len(exceed)
+
+        gpd_fits[asset] = {
+            "gpd_xi": xi_hat,
+            "gpd_beta": beta_hat,
+            "threshold": u,
+            "p_u": p_u,
+            "n_exceedances": n_exc,
+            "method": "GPD",
+            "diagnostic_data": excess,
+        }
+
+        print(
+            f"{asset}: u={u:.4f}, ξ={xi_hat:.4f}, β={beta_hat:.4f}, n_exc={n_exc} (p_u={p_u:.4f})"
+        )
+
+    # 2) Compute dynamic VaR forecasts
+    VaR_extreme = pd.DataFrame(
+        index=test_dates,
+        columns=pd.MultiIndex.from_product(
+            [alpha_list, all_assets, ["independent"]],
+            names=["alpha", "asset", "theta_type"],
+        ),
+        dtype=float,
+    )
+
+    print("\nComputing GPD-based dynamic VaR forecasts...")
+    for alpha in alpha_list:
+        for asset in all_assets:
+            gpd = gpd_fits[asset]
+            if np.isnan(gpd["gpd_xi"]):
+                VaR_extreme.loc[:, (alpha, asset, "independent")] = np.nan
+            else:
+                xi, beta, u_val, p_u_val = (
+                    gpd["gpd_xi"],
+                    gpd["gpd_beta"],
+                    gpd["threshold"],
+                    gpd["p_u"],
+                )
+                factor = ((1 / alpha * p_u_val) ** xi - 1) / xi
+                VaR_extreme.loc[:, (alpha, asset, "independent")] = mu_all[
+                    asset
+                ] + sigma_all[asset] * (u_val + beta * factor)
+
+    # 3) Summary statistics
+    summary_base = pd.DataFrame(
+        {
+            "xi": [gpd_fits[a]["gpd_xi"] for a in all_assets],
+            "n_exceedances": [gpd_fits[a]["n_exceedances"] for a in all_assets],
+            "threshold": [gpd_fits[a]["threshold"] for a in all_assets],
+        },
+        index=all_assets,
+    )
+
+    for alpha in alpha_list:
+        var_ind_means = [
+            VaR_extreme.loc[:, (alpha, a, "independent")].mean() for a in all_assets
+        ]
+        alpha_summary = pd.DataFrame(
+            {"VaR_ind_mean": var_ind_means}, index=all_assets
+        ).join(summary_base)
+        print(f"\nα = {alpha}\n" + "—" * 80)
+        print(alpha_summary)
+    # 4) Visualization
+    n = len(all_assets)
+    ncols = 2 if n > 1 else 1
+    nrows = (n + ncols - 1) // ncols
+    fig, axes = plt.subplots(nrows, ncols, figsize=(14, 4 * nrows))
+    axes = np.atleast_1d(axes).flatten()
+
+    colormaps = [plt.cm.Reds, plt.cm.Blues, plt.cm.Greens]
+
+    for i, asset in enumerate(all_assets):
+        ax = axes[i]
+        ax.plot(
+            test_dates,
+            test_all[asset],
+            color="#1a1a1a",
+            lw=1.25,
+            alpha=0.8,
+            label="Realized returns",
+            zorder=10,
+        )
+
+        for j, alpha in enumerate(alpha_list):
+            color = colormaps[j % len(colormaps)](0.6)
+            ax.plot(
+                test_dates,
+                -VaR_extreme.loc[:, (alpha, asset, "independent")],
+                color=color,
+                lw=1.2,
+                label=f"VaR (α={alpha:.2f})",
+            )
+
+        ax.axhline(0, color="gray", linestyle=":", lw=0.8, alpha=0.6)
+        ax.set_title(asset, fontweight="bold")
+        ax.set_ylabel("Return / VaR")
+        ax.legend(fontsize=8, loc="best", ncol=2, framealpha=0.9)
+        ax.grid(True, alpha=0.25, linestyle="--")
+
+        if i >= (nrows - 1) * ncols:
+            ax.set_xlabel("Date")
+
+    for j in range(n, len(axes)):
+        fig.delaxes(axes[j])
+
+    plt.tight_layout()
+    plt.show()
+
+    return gpd_fits, VaR_extreme
+
+
+# ———————————————————————————————————————————————————————————————————————————————————————————————————————————————————————— #
