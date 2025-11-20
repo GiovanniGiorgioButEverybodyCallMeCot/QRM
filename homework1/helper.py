@@ -1513,8 +1513,6 @@ def compute_breach_magnitudes(
     Args:
         realized: DataFrame of realized returns
         var_dict: Dict mapping method names to VaR DataFrames
-        alpha_list: List of confidence levels
-        assets: Assets to analyze. If None, uses all assets.
     Returns:
         DataFrame with MultiIndex (method, alpha, stat) and columns as assets
     """
